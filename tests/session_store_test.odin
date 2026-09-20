@@ -35,8 +35,10 @@ SESSION_CAPTURE_DIR :: "tests/fixtures/sessions"
 
 // The file oj writes for `--session=cap1` must be the reference's file, byte
 // for byte: same key order (sort_keys puts `__meta__` first), same four-space
-// indentation, same trailing newline — and the same 0700 directory / 0644 file
-// modes the reference produces.
+// indentation, same trailing newline — and the same 0700 directory. The file
+// mode is the port's own 0600 rather than the reference's 0644: a deliberate
+// divergence, recorded at SESSION_FILE_MODE (store.odin) and in
+// docs/security-findings.md SF-004.
 @(test)
 test_session_cap1_file_matches_the_reference_capture :: proc(t: ^testing.T) {
 	backing := context.allocator
@@ -98,8 +100,9 @@ test_session_cap1_file_matches_the_reference_capture :: proc(t: ^testing.T) {
 		)
 	}
 
-	// The reference's own modes: `mkdir(mode=0o700)` for the directory and the
-	// default 0644 for the file.
+	// The reference's own directory mode (`mkdir(mode=0o700)`), and the port's
+	// file mode: 0600, a deliberate divergence from the reference's 0644
+	// (SESSION_FILE_MODE, store.odin; docs/security-findings.md SF-004).
 	directory, directory_err := os.stat(
 		fmt.aprintf(
 			"%s/config/sessions/127.0.0.1_8765",
@@ -127,8 +130,69 @@ test_session_cap1_file_matches_the_reference_capture :: proc(t: ^testing.T) {
 	if file_err == nil {
 		testing.expectf(
 			t,
-			file.mode == os.Permissions{.Read_User, .Write_User, .Read_Group, .Read_Other},
-			"session file mode is %v, want 0644",
+			file.mode == os.Permissions{.Read_User, .Write_User},
+			"session file mode is %v, want 0600",
+			file.mode,
+		)
+	}
+
+	session_teardown(sandbox, &out, &err_out, allocator)
+	expect_no_leaks(t, &track)
+}
+
+// A session file an older build (or httpie) left at 0644 is tightened by the
+// next save: the mode argument of `write_entire_file_from_bytes` only applies
+// when the file is created, so session_save chmods afterwards (SF-004). Red
+// with the constant alone, green with the chmod.
+@(test)
+test_session_save_tightens_an_existing_0644_file :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+	defer free_all(context.temp_allocator)
+
+	sandbox := session_sandbox(t, "tighten", allocator)
+
+	out, err_out: strings.Builder
+	strings.builder_init(&out, allocator)
+	strings.builder_init(&err_out, allocator)
+
+	// The same offline write the cap1 case makes, with the file already there
+	// and world-readable — the state a 3.2-era oj or httpie leaves behind.
+	session_seed(t, sandbox, "cap1.json", "cap1.json")
+	path := fmt.aprintf(
+		"%s/config/sessions/127.0.0.1_8765/cap1.json",
+		sandbox,
+		allocator = context.temp_allocator,
+	)
+	testing.expectf(
+		t,
+		os.chmod(path, os.Permissions{.Read_User, .Write_User, .Read_Group, .Read_Other}) == nil,
+		"cannot widen %s to 0644 for the test",
+		path,
+	)
+
+	argv := []string{
+		"oj",
+		"--session=cap1",
+		"--offline",
+		"-p", "hb",
+		"--pretty=none",
+		"POST", "http://127.0.0.1:8765/echo",
+		"a=1",
+	}
+	exit_code := run_session(t, argv, sandbox, &out, &err_out, allocator)
+	testing.expect_value(t, exit_code, int(cli.Exit_Code.Ok))
+
+	file, file_err := os.stat(path, context.temp_allocator)
+	testing.expectf(t, file_err == nil, "cannot stat the session file: %v", file_err)
+	if file_err == nil {
+		testing.expectf(
+			t,
+			file.mode == os.Permissions{.Read_User, .Write_User},
+			"a 0644 session file must be tightened on save, mode is %v",
 			file.mode,
 		)
 	}
