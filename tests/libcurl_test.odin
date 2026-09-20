@@ -53,6 +53,7 @@ test_option_constants_match_libcurl :: proc(t: ^testing.T) {
 	check_option(t, "HTTPAUTH", http.CURLOPT_HTTPAUTH)
 	check_option(t, "PATH_AS_IS", http.CURLOPT_PATH_AS_IS)
 	check_option(t, "WRITEDATA", http.CURLOPT_WRITEDATA)
+	check_option(t, "READDATA", http.CURLOPT_READDATA)
 	check_option(t, "POSTFIELDS", http.CURLOPT_POSTFIELDS)
 	check_option(t, "HTTPHEADER", http.CURLOPT_HTTPHEADER)
 	check_option(t, "SSLCERT", http.CURLOPT_SSLCERT)
@@ -64,6 +65,7 @@ test_option_constants_match_libcurl :: proc(t: ^testing.T) {
 	check_option(t, "SSLKEY", http.CURLOPT_SSLKEY)
 	check_option(t, "ACCEPT_ENCODING", http.CURLOPT_ACCEPT_ENCODING)
 	check_option(t, "WRITEFUNCTION", http.CURLOPT_WRITEFUNCTION)
+	check_option(t, "READFUNCTION", http.CURLOPT_READFUNCTION)
 	check_option(t, "HEADERFUNCTION", http.CURLOPT_HEADERFUNCTION)
 
 	// The info ids are not in the option table, so they are checked against the
