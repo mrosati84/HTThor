@@ -969,3 +969,281 @@ and both are reproducible with any local listener:
 touched, all of them named by the plan (`docs/security-findings.md`, the four SF-001 sources,
 `curl_transport.odin` for SF-002/SF-003, `libcurl.odin`/`types.odin`/`context.odin` for
 SF-003, `store.odin` for SF-004, and the four test files) — no unrelated file changed.
+
+---
+
+## Verification
+
+Task: `t_b1daab68` — *"Verify fixes and check for security regressions"*. Independent
+verification of the five in-scope items on branch `fix/security-rating-findings`
+(**base `0f3cf5d`, head `570a405`**, `origin/fix/security-rating-findings == 570a405`).
+Nothing in this section was taken from the coder's `## Implementation Notes`: every claim
+below was re-measured here, on this host, with the commands shown. Where the measurement is
+a scripted probe rather than an in-suite test, the probe is quoted so it can be re-created —
+the scripts live outside the tree (`~/.hermes/profiles/qa/cache/scratch/verify/`), as §9
+requires for the parity-harness-free tree.
+
+**Verdict: READY FOR PR.** All five in-scope findings PASS; no regression was introduced;
+every in-suite test that carries a fix was measured red on the pre-fix code; the two items
+without an in-suite test (SF-003's TLS behaviour, SF-001's cross-host wire path) were
+measured on real binaries against the reference (`requests` 2.33.0) run against the same
+loopback servers. The two coverage limits are named in V.11, not hidden.
+
+### V.1 Environment
+
+| | value |
+| --- | --- |
+| tree | `/home/matteo/htthor/.worktrees/t_b1daab68` (worktree, branch `qa/t_b1daab68-verify` = `570a405`) |
+| base tree / pre-fix binary | `0f3cf5d`, built in a throwaway worktree under the QA scratch dir |
+| Odin | `dev-2026-09-nightly:a2fb372` (toolchain `odin-linux-amd64-nightly+2026-09-01`) |
+| libcurl / OpenSSL | 8.5.0 / OpenSSL 3.0.13 |
+| reference | `requests` 2.33.0 (`should_strip_auth`, `resolve_redirects`, `Session.cookies`) |
+| binaries | pre-fix `sha256 ba6aa3a53f31…`, post-fix `sha256 24c5e43101d1…` (both `make build`, exit 0) |
+
+### V.2 Per-finding results (the §9.8 table, measured)
+
+| finding | in-suite test | fails pre-fix (measured here) | scripted / wire evidence | verdict |
+| --- | --- | --- | --- | --- |
+| SF-001 | `test_engine_rebuilds_the_cookie_header_on_a_redirect`, `test_session_renders_no_cookie_on_a_cross_host_hop`, `test_session_cookie_value_respects_domain_path_and_secure` | **yes** — 2 tests, 5 assertions, with `hop.redirect_target` forced false on the branch | two-listener wire probe (V.3): cross-host, cross-host jar, `Secure` downgrade, same-origin item, `127.0.0.1`→`127.0.0.10`; reference agrees on every case | **PASS** |
+| SF-002 | `test_should_strip_authorization_matches_requests`, `test_engine_keeps_and_strips_authorization_across_a_redirect` | **yes** — 4 of 9 rows red with the pre-fix body restored (confirms the plan's 5-row claim was wrong, as the coder's item 2 says) | 9-row probe vs `requests` (9/9) + a 1024-pair URL matrix (0 mismatches post-fix, 54 pre-fix) + wire: same-host/same-port scheme change | **PASS** |
+| SF-003 | `test_option_constants_match_libcurl` (id `10083`) | n/a in suite (new coverage; constant-guard bit proven in V.7) | TLS probe on `127.0.0.1:19200`, self-signed: bogus `--ciphers` **exit 0 pre-fix → exit 1 post-fix**; no-`--ciphers` control exit 0 both; valid TLS 1.2 list exit 0; TLS 1.3 suite name exit 1 (documented) | **PASS** |
+| SF-004 | `test_session_save_tightens_an_existing_0644_file` (+ the deliberately updated mode expectation) | **yes** — fails with `os.chmod` commented out | CLI probe: fresh file 0644→0600, pre-existing 0644→0600, directories 0700 unchanged, contents unchanged | **PASS** |
+| SF-005 | `test_option_constants_match_libcurl` | n/a in suite (new coverage; guard proven in V.7) | wrong `CURLOPT_READFUNCTION` makes the guard fail with libcurl's own number, and (with a colliding value) aborts the whole suite — the constant is load-bearing | **PASS** |
+
+Items marked **NOT REPRODUCIBLE** and fixed anyway: **none** — §9.2 records zero, so there was
+nothing of that kind to re-test. Out-of-scope findings (`SF-D1`–`SF-D3`, `DOC-*`, `SEC-02`/
+`SEC-03`/`SEC-04`/`SEC-06`, `MEM-*`) were checked only for *absence of change* (V.10).
+
+### V.3 SF-001 — `Cookie` must not follow a redirect (high)
+
+Two plain-HTTP loopback listeners, an origin on `127.0.0.1:P1` answering `302` with
+`Location:` on another host, and a sink that logs the raw request head it receives. Six
+cases, each run against the pre-fix binary, the post-fix binary, and (for A/B/D/E) the
+reference:
+
+| case | pre-fix hop 2 | post-fix hop 2 | `requests` 2.33.0 |
+| --- | --- | --- | --- |
+| A `Cookie:` item, `127.0.0.1` → `127.0.0.2` | `Cookie: sess=TOPSECRET` (**leak**) | none | none |
+| B session-jar cookie, same redirect | `Cookie: sess=TOPSECRET` (**leak**) | none | none |
+| C `Secure` jar cookie, `https://127.0.0.1:P` → `http://127.0.0.1:P` (one dual-protocol port) | sent **in cleartext** on hop 2 (**leak**) | none | not run (same rule) |
+| D control — jar cookie, same host / **other port** | `Cookie: sess=TOPSECRET` | `Cookie: sess=TOPSECRET` (**not over-stripped**) | sent |
+| E `Cookie:` item, same-origin `302 /start → /landing` | sent | none | none |
+| F hostile — cookie for `127.0.0.1`, `302` to `127.0.0.10` | `Cookie: sess=TOPSECRET` (**leak**) | none | — |
+
+Commands (post-fix binary; the session file is the `cap-cookie.json` shape, written under
+`$HTTPIE_CONFIG_DIR/sessions/127.0.0.1_<P1>/probe.json`):
+
+```sh
+# A
+build/oj --follow --all -p Hh GET http://127.0.0.1:19102/start 'Cookie:sess=TOPSECRET'
+# B / F / D: 302 to 127.0.0.2:19101 / 127.0.0.10:19101 / 127.0.0.1:19501
+build/oj --follow --all -p Hh --session=probe GET http://127.0.0.1:19102/start
+# C: dual listener (peeks the first byte, 0x16 => TLS) on 127.0.0.1:19105
+build/oj --follow --all --verify=no -p Hh --session=probe GET https://127.0.0.1:19105/start
+```
+
+The printed head agrees with the wire in every case: post-fix stdout carries exactly **one**
+`Cookie:` line (hop 1) for A/B/C/E/F and **two** for D, where the jar legitimately supplies
+one for each hop; pre-fix it carried two everywhere. Pre-fix evidence is the same probe run
+against a binary built from `0f3cf5d`.
+
+*Proof the in-suite tests bite.* On the branch with `hop.redirect_target` forced to `false`
+(the single line the fix turns on, `curl_transport.odin:1764`), and nothing else changed:
+
+```sh
+odin test tests -collection:src=src -o:speed -vet -warnings-as-errors \
+  -extra-linker-flags:"-lcurl" \
+  -define:ODIN_TEST_NAMES=tests.test_engine_rebuilds_the_cookie_header_on_a_redirect,tests.test_session_renders_no_cookie_on_a_cross_host_hop,tests.test_session_cookie_value_respects_domain_path_and_secure
+# Finished 3 tests ... 2 tests failed.
+#   a cross-host hop must not carry the first URL's Cookie
+#   the cross-host hop must not carry the jar's Cookie
+#   the jar refused this host: no Cookie line may go out
+#   a same-host hop must carry the jar's Cookie, got "item=1"
+#   the jar's path rule rejected the hop: no Cookie line may go out
+```
+
+### V.4 SF-002 — `should_strip_authorization` matches `requests` (medium)
+
+Three independent measurements, none of them the branch's own test:
+
+1. **The nine pinned rows**, by executing the real proc through a probe package that lives
+   outside the repo and is built against either `src` tree (`-collection:src=<tree>/src`):
+   pre-fix **4 rows diverge** (`http://h/a→https://h/b`, `http://h:80/a→https://h:443/b`,
+   `http://h:443/a→https://h:443/b`, `http://h:8080/a→https://h:8080/b`), post-fix **9/9
+   match** `requests.Session().should_strip_auth`.
+2. **A 32×32 URL matrix** (hosts `h`, `H`, `h2`, `127.0.0.1` × the two schemes × ports
+   absent / `:80` / `:443` / `:8080` × path `/a` = 32 URLs, 1024 ordered pairs): pre-fix **54 mismatches** with
+   the reference, post-fix **0**.
+3. **Wire**, one dual-protocol port so a same-host/same-port scheme change is reachable
+   without root: `--auth user:pass`, `http://127.0.0.1:P/start` → `302 https://127.0.0.1:P/secure`
+   → pre-fix hop 2 carried `Authorization: Basic dXNlcjpwYXNz` (**fail-open**), post-fix
+   carries none, and `requests` on the same server carries none. Control: a plain same-origin
+   `302 /start → /next` keeps `Authorization` on hop 2 (no over-stripping).
+
+*Proof the in-suite test bites:* with the pre-fix body restored verbatim on the branch, the
+table fails on exactly the four rows above (`got strip=true, want false` ×2,
+`got strip=false, want true` ×2) and the engine test passes either way — which is the
+coder's documented inaccuracy #2, independently confirmed.
+
+### V.5 SF-003 — `--ciphers` is applied (medium)
+
+Independent of the suite (which cannot speak TLS): a local TLS listener on
+`127.0.0.1:19200` with a self-signed cert, and the client's exit code — exactly the scripted
+half §SF-003 prescribes:
+
+| command | pre-fix | post-fix |
+| --- | --- | --- |
+| `build/oj --verify=no GET https://127.0.0.1:19200/` (control) | exit 0, body `ok` | exit 0, body `ok` |
+| `build/oj --verify=no --ciphers=NOT-A-REAL-CIPHER GET …` | **exit 0, body `ok`** (option ignored) | **exit 1**, `oj: error: TLS handshake failed …` |
+| `build/oj --verify=no --ciphers=ECDHE+AESGCM GET …` | exit 0 | exit 0 (a usable TLS 1.2 list still connects) |
+| `build/oj --verify=no --ciphers=TLS_AES_128_GCM_SHA256 GET …` | exit 0 | exit 1 (documented: `SSL_CTX_set_cipher_list` grammar, same as urllib3 `set_ciphers`) |
+| `build/oj GET https://127.0.0.1:19200/` (verify default) | exit 1 TLS failure | exit 1 TLS failure (SEC-02 control intact) |
+
+The listener's own log shows the bogus-cipher run aborting inside the handshake
+(`UNEXPECTED_EOF_WHILE_READING`) and the control completing on `TLSv1.3`. Regression checks:
+a bogus list on a **plain-http** URL still exits 0 with the body, and an empty `--ciphers=`
+on a TLS URL exits 0 — the option only constrains TLS cipher selection.
+
+### V.6 SF-004 — session file `0600` (hardening)
+
+CLI runs against a loopback sink with `--session=probe` (`$HTTPIE_CONFIG_DIR` in a scratch
+dir); modes read with `os.stat`:
+
+| | pre-fix | post-fix |
+| --- | --- | --- |
+| fresh file | `0644` | **`0600`** |
+| pre-existing `0644` file, saved again | `0644` (unchanged) | **`0600`** (tightened) |
+| directories `sessions/…` | `0700` | `0700` (unchanged) |
+| file written with `--auth alice:s3cr3t` | `0644`, contains the plaintext credential | `0600`, contents otherwise unchanged |
+
+*Proof the tightening test bites:* with the `os.chmod` line commented out, only
+`test_session_save_tightens_an_existing_0644_file` fails
+(`a 0644 session file must be tightened on save, mode is Permissions{Read_Other, Read_Group, Write_User, Read_User}`);
+`test_session_cap1_file_matches_the_reference_capture` still passes, because creation is
+covered by the constant and the *tightening* of an existing file is covered by the chmod —
+i.e. both halves of SF-004 are load-bearing.
+
+The only pre-existing test assertion the branch changes is the mode expectation itself
+(`0644` → `0600`, §9.7 item 4). That is the item's purpose; it is recorded here as a
+deliberate divergence, not a weakened test.
+
+### V.7 SF-005 — the two unguarded constants are guarded (hardening)
+
+With `CURLOPT_READFUNCTION` set to `20013` on the branch:
+
+```
+[ERROR] [libcurl_test.odin:18:check_option()] READFUNCTION: libcurl says 20012, src/http/libcurl.odin says 20013
+Finished 173 tests ... 5 tests failed.
+```
+
+(the guard fails first; four engine tests that upload a chunked body fail too, because the
+wrong number breaks the read callback — the constant is load-bearing, not decorative). With
+the value set to `20011` — the neighbouring `WRITEFUNCTION` number — the suite aborts with a
+glibc stdio error, one more sign the number reaches libcurl. SF-003's `SSL_CIPHER_LIST` row
+is in the same table and is exercised by V.5.
+
+### V.8 Why the card's step 2 ("checkout the base commit and run the new test") is done by neutralisation
+
+Running the branch's `tests/` against the base `src/` **does not compile**, so it cannot
+produce red/green evidence for the new tests:
+
+```sh
+git checkout 0f3cf5d -- src/            # in a scratch worktree that has the branch's tests/
+make test-unit
+# tests/libcurl_test.odin(63:37) Error: 'CURLOPT_SSL_CIPHER_LIST' is not declared by 'http'
+# tests/session_store_test.odin(587:12) Error: 'session_cookie_value' is not declared by 'session'
+# tests/http_engine_test.odin(2300:8) Error: 'Cookie_Hook' is not declared by 'http'
+# … 'Request' has no field 'cookie_hook' …
+```
+
+The new tests are written against the new API, which is the point. The equivalent red
+evidence was therefore taken the other way round — the branch with exactly one fix
+neutralised (V.3/V.4/V.6/V.7) — which keeps every other variable out of the measurement and
+is what the coder's "measured red with its fix neutralised" claims reproduce here.
+
+### V.9 Gates and tooling on the branch (`570a405`)
+
+```sh
+make check      # exit 0 — `odin check src` and `odin check tests`, -vet -warnings-as-errors, zero warnings
+make build      # exit 0
+make test-unit  # exit 0 — "colorize goldens: 421 cases, 0 mismatches"
+                #           "Finished 173 tests in 1.022078326s. All tests were successful."
+```
+
+* **Test inventory:** `grep -ro '@(test)' tests | wc -l` → **173** on the branch vs **167** at
+  `0f3cf5d`; six tests added, **none removed**:
+  `test_engine_rebuilds_the_cookie_header_on_a_redirect`,
+  `test_session_cookie_value_respects_domain_path_and_secure`,
+  `test_session_renders_no_cookie_on_a_cross_host_hop`,
+  `test_should_strip_authorization_matches_requests`,
+  `test_engine_keeps_and_strips_authorization_across_a_redirect`,
+  `test_session_save_tightens_an_existing_0644_file`.
+* **Dependency audit:** there is no dependency manifest to audit (no `requirements.txt`,
+  `Cargo.toml`, `go.mod`, `package.json`, `pyproject.toml`, `Gemfile`, `vcpkg.json`,
+  `conanfile.txt`). The branch changes no build file and adds no dependency: `ldd build/oj`
+  lists only the system libraries it already used (`libcurl.so.4` 8.5.0-2ubuntu10.13,
+  `libssl`/`libcrypto` 3.0.13, `libnghttp2`, `libidn2`, `libpsl`, `libssh`, `librtmp`,
+  `libzstd`, `libbrotlidec`, `libz`, `libm`, `libc`).
+* **Static analysis:** `make check` (Odin `-vet -warnings-as-errors`) is the project's SAST
+  gate and is green with zero warnings on `src` and `tests`. No other linter/SAST tool is
+  configured in the tree (`grep -rniE 'lint|sast|audit|scan|valgrind' README.md Makefile
+  docs/ARCHITECTURE.md` → one prose hit).
+* **Secret scan:** `git diff 0f3cf5d..570a405 | grep -E '^\+.*(BEGIN .*PRIVATE KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-)'`
+  → no hits. The only credential-shaped strings the branch adds are sample values in prose
+  and tests (`alice:s3cr3t`, `TOPSECRET`, `SECUREJARSECRET`), none of them real.
+* **Memory-safety spot check (extra, not required by the plan):** `valgrind` on the SF-001
+  path (followed redirect with a session jar), symbol-bearing debug builds of both trees:
+  **no invalid reads/writes and no use-after-free in either binary**; both report the same
+  two contexts, both inside the Odin runtime's heap allocator
+  (`runtime::conditional_mem_zero` ← `heap_allocator_proc` ← `strings::write_string` ←
+  `cli::pure_path_join`), with 168 errors pre-fix vs 170 post-fix. That is a known benign
+  pattern of the runtime's own allocator bookkeeping, present identically before and after
+  the change; it is recorded as a coverage note (V.11), not as a fix-blocking finding.
+
+### V.10 Diff review for regressions
+
+Reviewed `git diff 0f3cf5d..570a405` (13 files: `docs/security-findings.md` added, 8 `src`
+files, 4 test files — exactly the §9.6 in-scope list; no build file, no golden, no
+`tests/fixtures`):
+
+| check | result |
+| --- | --- |
+| new `eval`/`exec`/shell-out | none — `grep -rnE '\beval\b|os.process|/bin/sh|system\(' src` → no hits (Odin has no `eval`) |
+| `CURLOPT_VERBOSE` introduced | no — still only the constant (`libcurl.odin:89`) and its constant-table row; nothing in `src` sets it (SEC-04 preserved) |
+| TLS verification weakened | no — `CURLOPT_SSL_VERIFYPEER (req.verify?1:0)` / `VERIFYHOST (req.verify?2:0)` / `CAINFO` lines are untouched by the diff, and the self-signed probe is still refused without `--verify=no` |
+| `Secure`-cookie handling dropped | no — `cookie_applies` is untouched; the fix routes *more* traffic through it (V.3 case C) |
+| validation removed / checks weakened | no — the only deleted test lines are the deliberate `0644`→`0600` expectation, a test-helper refactor (`engine_server_start_on`), and comments; no test proc removed (167→173) |
+| secrets committed | no (V.9) |
+| debug logging of sensitive data | no new `fmt.print*` of cookie/auth values in `src`; the rendered hop head now *drops* the `Cookie` line the wire no longer carries (V.3) |
+| ownership/aliasing | the new `Request.cookie_hook` is borrowed (zero value = no session) and released by nobody, as documented in `types.odin`; the re-derived string is freed by the caller path in both `apply_hop` and `write_hop_request`; `Options.ciphers` is borrowed from `cli.Options` and freed in `options_destroy` |
+
+### V.11 Coverage limits (stated, not hidden)
+
+* **No in-suite TLS capability.** The pinned toolchain's `core/crypto` has no `tls` package
+  (§9.1), so SF-003's behavioural half and the `https` rows of SF-002 can only be measured by
+  the scripted probes above; `build/` is git-ignored, so no TLS test is committable. This is
+  the same limitation the plan records — it is a limit of the branch, not of this
+  verification.
+* **Probe scripts live outside the tree** (QA scratch dir), by the same §9 rule that keeps the
+  tree free of a parity harness. Everything needed to rebuild them is in V.3–V.5 (listener
+  roles, exact commands, expected exit codes); the pre-fix comparison binary is a plain
+  `make build` of `0f3cf5d`.
+* **Not re-verified here (unchanged by the branch, out of scope):** `SF-D1`–`SF-D3` (still
+  deferred), `DOC-01`–`DOC-08`, the 8 `*_generated.odin` files, `src/http/url.odin` /
+  `idna_generated.odin` parser-differential review, `src/http/proxy.odin`, netrc permission
+  enforcement — the same list §8 and §9.5 leave open. The branch touches none of them.
+* **Valgrind noise** (V.9) is confined to the Odin runtime allocator on both sides; no
+  allocation *leak* assertion in the suite regressed — the branch runs **116** leak
+  assertions (`85` `expect_no_leaks` + `31` `engine_no_leaks`; the base has 109) and all of
+  them pass inside the 173-test run.
+
+### V.12 Final verdict
+
+**READY FOR PR.** Every in-scope finding (`SF-001`–`SF-005`) has an explicit PASS backed by a
+reproducible command or probe; every in-suite test that carries a fix was measured red on the
+pre-fix code; the full suite and the project's static gate are green on the pushed SHA; the
+diff introduces no new `eval`/`exec`, no disabled TLS check, no re-enabled credential replay,
+no secret, and no weakened test. Nothing was fixed by QA — the branch is unchanged by this
+verification except this section.
+
+READY FOR PR
