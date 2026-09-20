@@ -1488,3 +1488,39 @@ test_str_is_printable_matches_the_generated_bitmap :: proc(t: ^testing.T) {
 	testing.expect_value(t, hash, http.PYTHON_PRINTABLE_BITMAP_HASH)
 }
 
+// should_strip_authorization is requests' should_strip_auth (sessions.py:128-158)
+// case for case: credentials do not follow a redirect to another host, another
+// port or another scheme, with the one exception of a standard-port http ->
+// https upgrade on the same host. The expected column is the reference's own
+// answer, measured against requests 2.33.0 (docs/security-findings.md §9.1).
+@(test)
+test_should_strip_authorization_matches_requests :: proc(t: ^testing.T) {
+	cases := [?]struct {
+		old_url: string,
+		new_url: string,
+		strip:   bool,
+	}{
+		{"http://h/a", "https://h/b", false},
+		{"http://h:80/a", "https://h:443/b", false},
+		{"http://h/a", "http://h/b", false},
+		{"http://h:443/a", "https://h:443/b", true},
+		{"https://h:80/a", "https://h/b", true},
+		{"http://h:8080/a", "https://h:8080/b", true},
+		{"http://h/a", "https://h:8443/b", true},
+		{"http://h/a", "http://h:8080/b", true},
+		{"http://h/a", "https://other/b", true},
+	}
+	for test_case in cases {
+		got := http.should_strip_authorization(test_case.old_url, test_case.new_url)
+		testing.expectf(
+			t,
+			got == test_case.strip,
+			"%s -> %s: got strip=%v, want %v",
+			test_case.old_url,
+			test_case.new_url,
+			got,
+			test_case.strip,
+		)
+	}
+}
+

@@ -1214,7 +1214,9 @@ url_parts :: proc(url: string) -> Url_Parts {
 // should_strip_authorization is requests' should_strip_auth: the credentials do
 // not follow a redirect to another host, another port or another scheme. The
 // one exception the reference makes is an upgrade from http to https on the
-// same host, which keeps them.
+// same host — on their *standard* ports — and requests evaluates it before any
+// default-port normalisation, so the order below is the reference's
+// (sessions.py:128-158).
 should_strip_authorization :: proc(old_url: string, new_url: string) -> bool {
 	if strings.equal_fold(old_url, new_url) {
 		return false
@@ -1224,15 +1226,24 @@ should_strip_authorization :: proc(old_url: string, new_url: string) -> bool {
 	if !strings.equal_fold(old.host, new.host) {
 		return true
 	}
-	old_port := old.port != 0 ? old.port : (strings.equal_fold(old.scheme, "https") ? 443 : 80)
-	new_port := new.port != 0 ? new.port : (strings.equal_fold(new.scheme, "https") ? 443 : 80)
-	if old_port != new_port {
-		return true
-	}
-	if strings.equal_fold(old.scheme, new.scheme) {
+	// The reference's one exception, evaluated *before* any default-port
+	// normalisation: http (80 or absent) -> https (443 or absent) keeps them
+	// (sessions.py:138-144).
+	if strings.equal_fold(old.scheme, "http") && (old.port == 0 || old.port == 80) &&
+	   strings.equal_fold(new.scheme, "https") && (new.port == 0 || new.port == 443) {
 		return false
 	}
-	return !(strings.equal_fold(old.scheme, "http") && strings.equal_fold(new.scheme, "https"))
+	changed_port := old.port != new.port
+	changed_scheme := !strings.equal_fold(old.scheme, new.scheme)
+	// A same-scheme hop that only spells the default port differently is the same
+	// origin (sessions.py:146-155, `default_port`).
+	default_port := strings.equal_fold(old.scheme, "https") ? 443 : 80
+	if !changed_scheme &&
+	   (old.port == 0 || old.port == default_port) &&
+	   (new.port == 0 || new.port == default_port) {
+		return false
+	}
+	return changed_port || changed_scheme
 }
 
 // transport_send performs the exchange for `req` (already prepared) and fills

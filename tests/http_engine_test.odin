@@ -2430,3 +2430,92 @@ test_engine_rebuilds_the_cookie_header_on_a_redirect :: proc(t: ^testing.T) {
 	engine_server_destroy(origin)
 	engine_no_leaks(t, &track)
 }
+
+// ENGINE_AUTHORIZATION is `Basic alice:s3cr3t`, the credential line the SF-002
+// cases put on the request.
+ENGINE_AUTHORIZATION :: "Basic YWxpY2U6czNjcjN0"
+
+// SF-002: `Authorization` follows a redirect that stays on the origin and is
+// dropped when the origin changes (requests' should_strip_auth, sessions.py:
+// 128-158). Part (a) is the request-relative Location that stays on the origin;
+// part (b) is the same host on another port, where the second listener's bytes
+// are the only witness — and the case a fail-open rewrite would leak through.
+@(test)
+test_engine_keeps_and_strips_authorization_across_a_redirect :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	origin, origin_started := engine_server_start(backing)
+	testing.expect(t, origin_started, "the origin server must start")
+	other, other_started := engine_server_start(backing)
+	testing.expect(t, other_started, "the other-origin listener must start")
+
+	if origin_started && other_started {
+		start_url := engine_url(origin, "/start", allocator)
+		defer delete(start_url, allocator)
+
+		// (a) `Location: /next` is the same origin, so the credentials stay.
+		engine_queue_reply(origin, "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		request, create_err := http.request_create(allocator, .GET, start_url, nil)
+		testing.expect_value(t, create_err, http.Error.None)
+		if create_err == .None {
+			request.follow_redirects = true
+			request.max_redirects = 5
+			testing.expect_value(
+				t,
+				http.request_add_header(&request, "Authorization", ENGINE_AUTHORIZATION),
+				http.Error.None,
+			)
+			response: http.Response
+			if engine_send(t, &request, &response) == .None {
+				second := engine_request_clone(origin, 1, allocator) or_else ""
+				value, has_authorization := engine_header_of(second, "Authorization")
+				testing.expectf(
+					t,
+					has_authorization && value == ENGINE_AUTHORIZATION,
+					"a same-origin hop must keep Authorization, got %q",
+					value,
+				)
+				delete(second, allocator)
+			}
+			http.response_destroy(&response)
+			http.request_destroy(&request)
+		}
+
+		// (b) an absolute Location on another port is another origin, so the
+		// credentials do not go out.
+		target := engine_url(other, "/landing", allocator)
+		reply := engine_redirect_reply(target, allocator)
+		delete(target, allocator)
+		engine_queue_reply(origin, reply)
+		delete(reply, allocator)
+
+		request_b, create_err_b := http.request_create(allocator, .GET, start_url, nil)
+		testing.expect_value(t, create_err_b, http.Error.None)
+		if create_err_b == .None {
+			request_b.follow_redirects = true
+			request_b.max_redirects = 5
+			testing.expect_value(
+				t,
+				http.request_add_header(&request_b, "Authorization", ENGINE_AUTHORIZATION),
+				http.Error.None,
+			)
+			response_b: http.Response
+			if engine_send(t, &request_b, &response_b) == .None {
+				landing := engine_request_clone(other, 0, allocator) or_else ""
+				_, has_authorization := engine_header_of(landing, "Authorization")
+				testing.expect(t, !has_authorization, "an origin-changing hop must not carry Authorization")
+				delete(landing, allocator)
+			}
+			http.response_destroy(&response_b)
+			http.request_destroy(&request_b)
+		}
+	}
+
+	engine_server_destroy(other)
+	engine_server_destroy(origin)
+	engine_no_leaks(t, &track)
+}
