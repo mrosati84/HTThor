@@ -13,6 +13,7 @@ package tests
 
 import "core:fmt"
 import "core:mem"
+import "core:net"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -421,6 +422,92 @@ test_session_cookie_jar_replays_a_set_cookie :: proc(t: ^testing.T) {
 	}
 
 	session.session_destroy(&session_instance)
+	session_teardown(sandbox, &out, &err_out, allocator)
+	expect_no_leaks(t, &track)
+}
+
+// The rendered half of SF-001: a followed hop's printed head must show what the
+// wire sends. requests pops the first URL's `Cookie` and re-derives it from the
+// jar for the new URL, so a cross-host hop prints no `Cookie` line at all while
+// the first request prints the jar's — the same rule write_hop_request applies
+// to the transport's (session_cookie_hook). The listeners' bytes are asserted
+// too, so the render and the wire cannot drift apart.
+@(test)
+test_session_renders_no_cookie_on_a_cross_host_hop :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+	defer free_all(context.temp_allocator)
+
+	origin, origin_started := engine_server_start(backing)
+	testing.expect(t, origin_started, "the origin server must start")
+	sink, sink_started := engine_server_start_on(backing, net.IP4_Address { 127, 0, 0, 2 })
+	testing.expect(t, sink_started, "the cross-host sink must start")
+	if !origin_started || !sink_started {
+		engine_server_destroy(sink)
+		engine_server_destroy(origin)
+		expect_no_leaks(t, &track)
+		return
+	}
+
+	sandbox := session_sandbox(t, "render-cookie", allocator)
+	out, err_out: strings.Builder
+	strings.builder_init(&out, allocator)
+	strings.builder_init(&err_out, allocator)
+
+	// The reference's own cookie file, in the directory this origin's
+	// host and port map to (`<host>_<port>`, store.odin's session_host_dir).
+	session_seed_in_host_dir(
+		t,
+		sandbox,
+		fmt.aprintf("127.0.0.1_%d", origin.port, allocator = context.temp_allocator),
+		"cap-cookie.json",
+		"cap-cookie.json",
+	)
+
+	target := fmt.aprintf("http://127.0.0.2:%d/landing", sink.port, allocator = allocator)
+	reply := engine_redirect_reply(target, allocator)
+	engine_queue_reply(origin, reply)
+	delete(reply, allocator)
+	delete(target, allocator)
+
+	url := engine_url(origin, "/start", allocator)
+	argv := []string{
+		"oj",
+		"--session=cap-cookie",
+		"--follow",
+		"--pretty=none",
+		"-p", "Hh",
+		url,
+	}
+	exit_code := run_session(t, argv, sandbox, &out, &err_out, allocator)
+	testing.expect_value(t, exit_code, int(cli.Exit_Code.Ok))
+
+	rendered := strings.to_string(out)
+	testing.expectf(
+		t,
+		strings.count(rendered, "Cookie: BODY=deterministic-cookie") == 1,
+		"the jar's Cookie belongs to the first request only:\n%s",
+		rendered,
+	)
+	origin_cookie, origin_has := engine_cookie_of(origin, 0, allocator)
+	testing.expectf(
+		t,
+		origin_has && origin_cookie == "BODY=deterministic-cookie",
+		"the origin must have received the jar's cookie, got %q",
+		origin_cookie,
+	)
+	_, sink_has := engine_cookie_of(sink, 0, allocator)
+	testing.expect(t, !sink_has, "the cross-host hop must not carry the jar's Cookie")
+
+	// Everything the tracking allocator is owed is released before the leak
+	// check, which is why these are explicit and not deferred (the file's
+	// other cases do the same).
+	delete(url, allocator)
+	engine_server_destroy(sink)
+	engine_server_destroy(origin)
 	session_teardown(sandbox, &out, &err_out, allocator)
 	expect_no_leaks(t, &track)
 }
