@@ -192,6 +192,20 @@ Body_Source :: enum {
 	Raw,
 }
 
+// Cookie_Hook is the session's jar applied to one hop: requests pops `Cookie`
+// on every followed redirect and re-derives it for the new URL from the merged
+// jar (sessions.py:235-243), and only the jar knows the domain / path / Secure
+// policy that decides what the new URL gets. `value` is nil when the run has no
+// session; the transport then drops the header instead of rebuilding it.
+Cookie_Hook :: struct {
+	// data is the hook's opaque state — the session for the jar
+	// (session_cookie_value_for), which owns itself.
+	data: rawptr,
+	// value returns the `Cookie` header value for `url`, owned by `allocator`
+	// (the caller deletes it); "" means "this URL gets no cookie".
+	value: proc(data: rawptr, url: string, allocator: mem.Allocator) -> string,
+}
+
 // Request describes one HTTP exchange. Every string and slice in it is owned by
 // `allocator` and released by request_destroy; nothing borrows from argv or
 // from a caller-owned buffer.
@@ -380,6 +394,11 @@ Request :: struct {
 	// against this CA bundle instead of the system store (CURLOPT_CAINFO).
 	// `--verify=no` is `verify = false` and leaves ca_bundle empty.
 	ca_bundle: string,
+	// cookie_hook re-derives a followed hop's `Cookie` header from the session
+	// jar (Cookie_Hook above). BORROWED: its `data` is the session, which
+	// owns itself; the zero value means the run has no session and
+	// request_destroy releases nothing for it.
+	cookie_hook: Cookie_Hook,
 
 	// encode_error is the UnicodeEncodeError the reference raises while it
 	// re-encodes one of the request's strings: the first header value, query

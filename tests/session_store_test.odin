@@ -361,6 +361,94 @@ test_session_cookie_jar_replays_a_set_cookie :: proc(t: ^testing.T) {
 	expect_no_leaks(t, &track)
 }
 
+// session_cookie_value is the jar's policy in one call — the rule a followed
+// hop's `Cookie` header is re-derived through (http.Cookie_Hook, SF-001) — so it
+// is pinned directly here as well as on the wire.
+@(test)
+test_session_cookie_value_respects_domain_path_and_secure :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+	defer free_all(context.temp_allocator)
+
+	sandbox := session_sandbox(t, "cookie-value", allocator)
+
+	out, err_out: strings.Builder
+	strings.builder_init(&out, allocator)
+	strings.builder_init(&err_out, allocator)
+
+	argv := []string{
+		"oj",
+		"--session=cookie-value",
+		"--offline",
+		"-p", "h",
+		"--pretty=none",
+		"http://example.com/echo",
+	}
+	options, parse_err := session_options(t, argv, sandbox, allocator)
+	testing.expect_value(t, parse_err.kind, cli.Parse_Error_Kind.None)
+	session_instance, opened := session.session_open(&options, output.Console{writer = strings.to_writer(&err_out), width = cli.RICH_WIDTH}, allocator)
+	cli.options_destroy(&options)
+	testing.expectf(t, opened, "the session could not be opened: %s", strings.to_string(err_out))
+	if !opened {
+		session_teardown(sandbox, &out, &err_out, allocator)
+		expect_no_leaks(t, &track)
+		return
+	}
+
+	// One host-only Secure cookie under /private, one plain cookie under
+	// /public, and one plain cookie for every path — the three together pin the
+	// domain, the path and the Secure rule, and the longest-path-first order.
+	// The host is a name, not a loopback address: `is_local_host` keeps a Secure
+	// cookie travelling over plain http to localhost, which would hide the
+	// Secure rule below.
+	response := http.Response {
+		status  = 200,
+		headers = []http.Header {
+			{name = "Set-Cookie", value = "SESS=JARSECRET; Path=/private; Secure"},
+			{name = "Set-Cookie", value = "PLAIN=1; Path=/public"},
+			{name = "Set-Cookie", value = "ROOT=1; Path=/"},
+		},
+		url = "http://example.com/echo",
+	}
+	session.session_collect_cookies(&session_instance, &response)
+	testing.expectf(t, len(session_instance.cookies) == 3, "the jar holds %d cookies", len(session_instance.cookies))
+
+	cases := [?]struct {
+		what:   string,
+		host:   string,
+		path:   string,
+		secure: bool,
+		want:   string,
+	}{
+		{"the stored host, the Secure cookie's own path, https", "example.com", "/private", true, "SESS=JARSECRET; ROOT=1"},
+		{"a path below the cookie's own is a match", "example.com", "/private/x", true, "SESS=JARSECRET; ROOT=1"},
+		{"a Secure cookie over plain http", "example.com", "/private", false, "ROOT=1"},
+		{"a path outside the cookie's own", "example.com", "/other", true, "ROOT=1"},
+		{"the whole host", "example.com", "/", true, "ROOT=1"},
+		{"the other cookie's path", "example.com", "/public", false, "PLAIN=1; ROOT=1"},
+		{"another host", "other.example.com", "/private", true, ""},
+		{"another host, any path", "other.example.com", "/", true, ""},
+	}
+	for test_case in cases {
+		value := session.session_cookie_value(
+			&session_instance,
+			test_case.host,
+			test_case.path,
+			test_case.secure,
+			allocator,
+		)
+		testing.expectf(t, value == test_case.want, "%s: got %q, want %q", test_case.what, value, test_case.want)
+		delete(value, allocator)
+	}
+
+	session.session_destroy(&session_instance)
+	session_teardown(sandbox, &out, &err_out, allocator)
+	expect_no_leaks(t, &track)
+}
+
 // A cookie that has already expired is not persisted, and one that expires in a
 // later reply deletes the stored cookie (utils.get_expired_cookies).
 @(test)

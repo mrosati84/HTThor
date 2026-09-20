@@ -685,6 +685,11 @@ Hop :: struct {
 	// back on a later hop, because each hop's prepared request is a copy of
 	// the previous one (sessions.py:204-258).
 	purge_body_headers: bool,
+	// redirect_target is true for every hop the chain followed into: the
+	// request's own `Cookie` header was derived for the *first* URL only and
+	// must be re-derived for this one (requests' resolve_redirects,
+	// sessions.py:235-243).
+	redirect_target: bool,
 }
 
 // method_expects_a_body is the complement of urllib3's
@@ -989,6 +994,14 @@ apply_hop :: proc(
 		if !hop.keep_authorization && strings.equal_fold(header.name, "Authorization") {
 			skip = true
 		}
+		// requests pops `Cookie` on every followed redirect and re-derives it
+		// from the merged jar for the new URL (sessions.py:235-243). The header
+		// this request carries was built for the *first* URL only, so it is
+		// never replayed onto a hop the chain followed into; the re-derived
+		// value is appended after the loop, where this hop's URL is known.
+		if hop.redirect_target && strings.equal_fold(header.name, "Cookie") {
+			skip = true
+		}
 		if skip {
 			continue
 		}
@@ -1074,6 +1087,34 @@ apply_hop :: proc(
 		slist^ = curl_slist_append(slist^, entry)
 		if slist^ == nil {
 			return .Out_Of_Memory
+		}
+	}
+	// The `Cookie` a followed hop carries, re-derived from the jar for its own
+	// URL. requests' own order: `resolve_redirects` pops the header and
+	// `prepare_cookies` puts it back at the end of the head (sessions.py:235-243),
+	// so the line closes the request's own headers and the Digest answer below
+	// still comes after it. No hook (no session in this run) or an empty value
+	// appends nothing — the reference sends a followed hop no cookie its jar
+	// does not supply for that URL.
+	if hop.redirect_target && req.cookie_hook.value != nil {
+		value := req.cookie_hook.value(req.cookie_hook.data, hop.url, req.allocator)
+		defer if value != "" {
+			delete(value, req.allocator)
+		}
+		if value != "" {
+			line, line_err := strings.concatenate({"Cookie: ", value}, req.allocator)
+			if line_err != .None {
+				return .Out_Of_Memory
+			}
+			entry, entry_ok := c_strings_add(c_strings, line)
+			delete(line, req.allocator)
+			if !entry_ok {
+				return .Out_Of_Memory
+			}
+			slist^ = curl_slist_append(slist^, entry)
+			if slist^ == nil {
+				return .Out_Of_Memory
+			}
 		}
 	}
 	// The Digest answer, last — which is where requests puts it: the header is
@@ -1696,6 +1737,7 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 			hop.body_spent = true
 		}
 		hop.keep_authorization = !should_strip_authorization(hop.url, next_url)
+		hop.redirect_target = true
 		hop.method = next_method
 		hop.url = next_url
 		hop.wire_url = next_wire_url

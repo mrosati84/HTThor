@@ -116,34 +116,35 @@ cookie_same_slot :: proc(a: ^Cookie, b: ^Cookie) -> bool {
 	       a.path == b.path
 }
 
-// session_apply_cookies adds the `Cookie` request header the jar produces for
-// this request, unless the command line already set one
-// (CookieJar.add_cookie_header: `if not request.has_header("Cookie")`).
-session_apply_cookies :: proc(session: ^Session, request: ^http.Request) {
+// session_cookie_value is the `Cookie` value the jar produces for a request to
+// `host`/`request_path` over `secure`, or "" when it has none. Owned by the
+// caller. session_apply_cookies is its first caller; a followed hop re-derives
+// through it (requests' resolve_redirects, sessions.py:235-243).
+session_cookie_value :: proc(
+	session: ^Session,
+	host: string,
+	request_path: string,
+	secure: bool,
+	allocator: mem.Allocator,
+) -> string {
 	if session == nil || len(session.cookies) == 0 {
-		return
+		return ""
 	}
-	if _, found := http.request_header_get(request, "Cookie"); found {
-		return
+	path := request_path
+	if path == "" {
+		path = "/"
 	}
-
-	allocator := session.allocator
-	request_path := request.path
-	if request_path == "" {
-		request_path = "/"
-	}
-	secure := request.scheme == .HTTPS
 	now := time.time_to_unix(time.now())
 
 	indices: [dynamic]int
 	defer delete(indices)
 	for &cookie, index in session.cookies {
-		if cookie_applies(&cookie, request.host, request_path, secure, now) {
+		if cookie_applies(&cookie, host, path, secure, now) {
 			append(&indices, index)
 		}
 	}
 	if len(indices) == 0 {
-		return
+		return ""
 	}
 
 	// http/cookiejar.py's `_cookie_attrs` sends the longest path first; the
@@ -170,9 +171,55 @@ session_apply_cookies :: proc(session: ^Session, request: ^http.Request) {
 	}
 	// The builder's buffer is handed over as the string (json.odin:628-634 has
 	// the same shape), so this is the one free site for it.
-	value := strings.to_string(builder)
-	defer delete(value, allocator)
+	return strings.to_string(builder)
+}
+
+// session_apply_cookies adds the `Cookie` request header the jar produces for
+// this request, unless the command line already set one
+// (CookieJar.add_cookie_header: `if not request.has_header("Cookie")`).
+session_apply_cookies :: proc(session: ^Session, request: ^http.Request) {
+	if session == nil || len(session.cookies) == 0 {
+		return
+	}
+	if _, found := http.request_header_get(request, "Cookie"); found {
+		return
+	}
+	value := session_cookie_value(session, request.host, request.path, request.scheme == .HTTPS, request.allocator)
+	if value == "" {
+		return
+	}
+	defer delete(value, request.allocator)
 	_ = http.request_add_header(request, "Cookie", value)
+}
+
+// session_cookie_hook installs the jar on the request the transport will send,
+// so a followed hop can re-derive its `Cookie` header (http.Cookie_Hook).
+session_cookie_hook :: proc(session: ^Session, request: ^http.Request) {
+	if session == nil {
+		return
+	}
+	request.cookie_hook = http.Cookie_Hook {
+		data  = session,
+		value = session_cookie_value_for,
+	}
+}
+
+// session_cookie_value_for is http.Cookie_Hook.value: the transport hands it a
+// followed hop's prepared URL. The split is the one `collect_response_cookies`
+// (:43-50) uses for the same purpose, so the host the jar matches against is
+// the host its cookies were stored for.
+@(private)
+session_cookie_value_for :: proc(data: rawptr, url: string, allocator: mem.Allocator) -> string {
+	session := cast(^Session) data
+	target, split_err := http.url_split(url, nil)
+	if split_err != .None {
+		return ""
+	}
+	request_path := target.path
+	if request_path == "" {
+		request_path = "/"
+	}
+	return session_cookie_value(session, target.host, request_path, target.scheme == .HTTPS, allocator)
 }
 
 // cookie_applies is `CookiePolicy.return_ok` for one cookie: an expired or
