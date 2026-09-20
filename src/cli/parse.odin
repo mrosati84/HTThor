@@ -3010,6 +3010,7 @@ process :: proc(p: ^Parser, opts: ^Options) -> string {
 	opts.timeout_given = ns.timeout_set
 	opts.path_as_is = ns.path_as_is
 	opts.verify = strings.clone(ns.verify, allocator) or_else ""
+	opts.ciphers = strings.clone(ns.ciphers, allocator) or_else ""
 	opts.cert = strings.clone(ns.cert, allocator) or_else ""
 	opts.cert_key = strings.clone(ns.cert_key, allocator) or_else ""
 	opts.cert_key_pass = strings.clone(ns.cert_key_pass, allocator) or_else ""

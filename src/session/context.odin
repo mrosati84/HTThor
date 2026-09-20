@@ -967,6 +967,7 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 	request.cert_key = options.cert_key
 	request.cert_key_pass = options.cert_key_pass
 	request.ca_bundle = verify_ca_bundle(options.verify)
+	request.ciphers = options.ciphers
 	if options.auth != "" {
 		if err := http.request_set_auth(request, options.auth, auth_type_of(options.auth_type)); err != .None {
 			return request_failure(ctx, err)

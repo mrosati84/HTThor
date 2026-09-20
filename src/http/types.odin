@@ -384,8 +384,8 @@ Request :: struct {
 	// definition.py:715-722). The key is dropped when the URL is built; an
 	// entry without a key is taken as the URL itself (proxy.odin).
 	proxy:    string,
-	// cert / cert_key / cert_key_pass / ca_bundle / proxy are BORROWED from
-	// cli.Options — the session aliases them in and only cli.options_destroy
+	// cert / cert_key / cert_key_pass / ca_bundle / ciphers / proxy are BORROWED
+	// from cli.Options — the session aliases them in and only cli.options_destroy
 	// frees them (ARCHITECTURE §4). Nothing here may release them.
 	cert:          string,
 	cert_key:      string,
@@ -394,6 +394,10 @@ Request :: struct {
 	// against this CA bundle instead of the system store (CURLOPT_CAINFO).
 	// `--verify=no` is `verify = false` and leaves ca_bundle empty.
 	ca_bundle: string,
+	// ciphers is `--ciphers`: OpenSSL's cipher-list grammar, handed to the
+	// library verbatim (CURLOPT_SSL_CIPHER_LIST). A list the library cannot use
+	// fails the handshake — the loud failure the help text promises.
+	ciphers: string,
 	// cookie_hook re-derives a followed hop's `Cookie` header from the session
 	// jar (Cookie_Hook above). BORROWED: its `data` is the session, which
 	// owns itself; the zero value means the run has no session and

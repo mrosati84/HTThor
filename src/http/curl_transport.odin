@@ -1427,6 +1427,19 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 			return map_curl_error(code)
 		}
 	}
+	// `--ciphers` is OpenSSL's cipher-list grammar and libcurl hands it to
+	// OpenSSL verbatim: a list the library cannot use fails the handshake with
+	// CURLE_SSL_CIPHER (mapped to .TLS_Failure above), which is the loud failure
+	// the help text promises.
+	if req.ciphers != "" {
+		ciphers_c, ciphers_ok := c_strings_add(&c_strings, req.ciphers)
+		if !ciphers_ok {
+			return .Out_Of_Memory
+		}
+		if code := setopt_string(handle, CURLOPT_SSL_CIPHER_LIST, ciphers_c); code != CURLE_OK {
+			return map_curl_error(code)
+		}
+	}
 	if req.cert != "" {
 		cert_c, cert_ok := c_strings_add(&c_strings, req.cert)
 		if !cert_ok {

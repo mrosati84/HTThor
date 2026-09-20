@@ -59,6 +59,7 @@ test_option_constants_match_libcurl :: proc(t: ^testing.T) {
 	check_option(t, "HEADERDATA", http.CURLOPT_HEADERDATA)
 	check_option(t, "CUSTOMREQUEST", http.CURLOPT_CUSTOMREQUEST)
 	check_option(t, "CAINFO", http.CURLOPT_CAINFO)
+	check_option(t, "SSL_CIPHER_LIST", http.CURLOPT_SSL_CIPHER_LIST)
 	check_option(t, "KEYPASSWD", http.CURLOPT_KEYPASSWD)
 	check_option(t, "SSLKEY", http.CURLOPT_SSLKEY)
 	check_option(t, "ACCEPT_ENCODING", http.CURLOPT_ACCEPT_ENCODING)
