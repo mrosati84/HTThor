@@ -1,0 +1,7 @@
+[01mHTTP[00m/1.1 200 [01mOK[00m
+X-Empty:
+X-Spaced :  double  spaced
+X-Cont: first
+  second
+not-a-header
+Set-Cookie: a=1; Path=/

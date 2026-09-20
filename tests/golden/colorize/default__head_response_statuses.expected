@@ -1,0 +1,6 @@
+[38;5;28;01mHTTP[39;00m[38;5;241m/[39m[38;5;241m1.1[39m [38;5;241m100[39m [38;5;167;01mContinue[39;00m
+HTTP/1.1 301 Moved Permanently
+[38;5;64mLocation[39m[38;5;241m:[39m /
+HTTP/1.1 404 Not Found
+HTTP/1.1 500 Internal Server Error
+[38;5;64mRetry-After[39m[38;5;241m:[39m 5

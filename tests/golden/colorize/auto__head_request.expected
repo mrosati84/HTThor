@@ -1,0 +1,8 @@
+[32mPOST[39;49;00m [04m[36m/echo[39;49;00m [34mHTTP[39;49;00m/[34m1.1[39;49;00m
+[36mAccept-Encoding[39;49;00m: gzip, deflate
+[36mConnection[39;49;00m: keep-alive
+[36mContent-Length[39;49;00m: 27
+[36mUser-Agent[39;49;00m: HTTPie/3.2.4
+[36mAccept[39;49;00m: application/json, */*;q=0.5
+[36mContent-Type[39;49;00m: application/json
+[36mHost[39;49;00m: 127.0.0.1:8765

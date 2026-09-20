@@ -1,0 +1,3 @@
+{"a": 1, // single
+ "b": 2, /* multi
+line */ "c": 3}

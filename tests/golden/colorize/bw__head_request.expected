@@ -1,0 +1,8 @@
+POST [01m/echo[00m [01mHTTP[00m/1.1
+Accept-Encoding: [03mgzip, deflate[00m
+Connection: [03mkeep-alive[00m
+Content-Length: [03m27[00m
+User-Agent: [03mHTTPie/3.2.4[00m
+Accept: [03mapplication/json, */*;q=0.5[00m
+Content-Type: [03mapplication/json[00m
+Host: [03m127.0.0.1:8765[00m

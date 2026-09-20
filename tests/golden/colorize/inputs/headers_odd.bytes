@@ -1,0 +1,7 @@
+HTTP/1.1 200 OK
+X-Empty:
+X-Spaced :  double  spaced
+X-Cont: first
+  second
+not-a-header
+Set-Cookie: a=1; Path=/

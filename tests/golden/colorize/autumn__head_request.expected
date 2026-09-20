@@ -1,0 +1,8 @@
+[38;5;34mPOST[39m [38;5;37;04m/echo[39;00m [38;5;19mHTTP[39m/[38;5;30m1.1[39m
+[38;5;33mAccept-Encoding[39m: [38;5;130mgzip, deflate[39m
+[38;5;33mConnection[39m: [38;5;130mkeep-alive[39m
+[38;5;33mContent-Length[39m: [38;5;130m27[39m
+[38;5;33mUser-Agent[39m: [38;5;130mHTTPie/3.2.4[39m
+[38;5;33mAccept[39m: [38;5;130mapplication/json, */*;q=0.5[39m
+[38;5;33mContent-Type[39m: [38;5;130mapplication/json[39m
+[38;5;33mHost[39m: [38;5;130m127.0.0.1:8765[39m
