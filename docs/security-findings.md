@@ -873,3 +873,99 @@ transport can make through the same session hook SF-001 added); golden: a
 Full gates for the branch: `make check` exit 0 (zero warnings, both packages), `make test-unit`
 exit 0 with the 167 existing tests plus the new ones, `421 goldens 0 mismatches` unchanged.
 Every count in this plan (167 tests, 421 goldens) is this worktree's, re-measured today.
+
+## Implementation Notes
+
+Branch `fix/security-rating-findings`, base `0f3cf5d`; this document was recovered from
+`wt/t_0c45de6d` (`8ade88c`) as the card's comment describes. Every in-scope item is
+implemented, in the plan's order, in a commit of its own.
+
+Gates on the final commit: `make check` exit 0 (zero warnings, `src` and `tests`), `make
+test-unit` exit 0 — **173 tests** (167 existing + 6 new) and `421 goldens 0 mismatches`,
+unchanged.
+
+| finding | commit | test that covers it | red before the fix |
+| --- | --- | --- | --- |
+| SF-001 | `37e9b65` (fix), `c0b8f84` (rendered hop) | `test_engine_rebuilds_the_cookie_header_on_a_redirect`, `test_session_cookie_value_respects_domain_path_and_secure`, `test_session_renders_no_cookie_on_a_cross_host_hop` | yes — 5 assertions fail with the hop's `Cookie` strip disabled; the scripted two-listener probe below separates pre-fix from post-fix |
+| SF-002 | `5452a6b` | `test_should_strip_authorization_matches_requests`, `test_engine_keeps_and_strips_authorization_across_a_redirect` | yes — the table is red on 4 of its 9 rows against the old predicate (measured, see item 2 below) |
+| SF-003 | `2566128` | `test_option_constants_match_libcurl` (id `10083`) | not in suite (new coverage); the TLS probe goes from exit 0 to a TLS failure |
+| SF-004 | `d003340` | `test_session_save_tightens_an_existing_0644_file`, plus the deliberately updated mode expectation in `test_session_cap1_file_matches_the_reference_capture` | yes — the tightening test fails with the constant alone (chmod disabled locally) |
+| SF-005 | `32bc45a` | `test_option_constants_match_libcurl` | not in suite (new coverage); a locally wrong number fails the table |
+
+Pre-fix measurements, taken on this branch with each fix neutralised in turn (so the new
+tests are the only variable):
+
+* SF-001, the strip disabled in the hop loop: `a cross-host hop must not carry the first
+  URL's Cookie`, `the jar refused this host: no Cookie line may go out`, `a same-host hop
+  must carry the jar's Cookie, got "item=1"`, `the jar's path rule rejected the hop: no
+  Cookie line may go out`, `the cross-host hop must not carry the jar's Cookie`.
+* SF-002, the old body restored: `http://h/a -> https://h/b: got strip=true, want false`,
+  `http://h:80/a -> https://h:443/b: got strip=true, want false`,
+  `http://h:443/a -> https://h:443/b: got strip=false, want true`,
+  `http://h:8080/a -> https://h:8080/b: got strip=false, want true`.
+* SF-004, `os.chmod` commented out: `a 0644 session file must be tightened on save, mode is
+  Permissions{Read_Other, Read_Group, Write_User, Read_User}`.
+* SF-005, `CURLOPT_READFUNCTION` set to `20011`: `READFUNCTION: libcurl says 20012,
+  src/http/libcurl.odin says 20011`.
+
+### Deviations, and what §9 got wrong
+
+1. **SF-003 needed CLI plumbing its file list omits.** `cli.Options` had no `ciphers` field
+   and `cli.parse` dropped the finished namespace's value, so `CURLOPT_SSL_CIPHER_LIST` had
+   nothing to apply: `--ciphers` is documented and parsed but never reached the transport.
+   The fix therefore also adds `Options.ciphers` (`src/cli/options.odin`), its clone in
+   `parse.odin` and its free in `options_destroy`. Without that the item is unreachable
+   from the CLI.
+2. **SF-002: 4 of 9 rows are red, not 5, and the engine test's part (b) does not
+   discriminate.** Same host, different port, same scheme is stripped by the old code as
+   well, so `test_engine_keeps_and_strips_authorization_across_a_redirect` proves the wire
+   behaviour but is green either way; so is part (a) (a same-origin hop is kept by both).
+   Every discriminating row changes the scheme `http -> https`, which this suite cannot
+   perform (the pinned toolchain has no TLS), so `test_should_strip_authorization_matches_requests`
+   carries the discrimination and the engine test pins the bytes.
+3. **SF-001 got a third test.** `write_hop_request` is a changed code path that nothing
+   covered: no case in the suite ran a live exchange through `session.run` with `--follow`,
+   so the printed hop head could have drifted from the wire unnoticed. The new
+   `test_session_renders_no_cookie_on_a_cross_host_hop` seeds the reference's cookie file,
+   follows a cross-host `302`, and asserts the jar's `Cookie` line is printed exactly once —
+   on the first request — while the listeners' bytes agree.
+4. **SF-005 also carries the `SSL_CIPHER_LIST` row** SF-003 introduced: one table, both
+   constants guarded.
+5. **The plan's §9.7 items are all real, and item 3 has a second edge worth a PR note:** a
+   TLS 1.3 *ciphersuite* name (`--ciphers=TLS_AES_128_GCM_SHA256`) now fails loudly, because
+   OpenSSL's `SSL_CTX_set_cipher_list` — which is what `CURLOPT_SSL_CIPHER_LIST` feeds —
+   speaks the TLS 1.2-and-below grammar (TLS 1.3 suites need `set_ciphersuites`). httpie
+   inherits exactly the same limitation through urllib3's `set_ciphers`, so this is the
+   reference's behaviour, not a new divergence; a valid TLS 1.2 list
+   (`--ciphers=ECDHE+AESGCM`) is unaffected.
+
+### Evidence commands for the QA card (`t_b1daab68`)
+
+The in-suite tests are in the table above; the two items with no committable test are these,
+and both are reproducible with any local listener:
+
+* **SF-003 (TLS).** A self-signed cert (`openssl req -x509 -newkey rsa:2048 -keyout key.pem
+  -out cert.pem -days 1 -nodes -subj "/CN=127.0.0.1"`) and any TLS listener on
+  `127.0.0.1:<PORT>` (`openssl s_server -accept <PORT> -cert cert.pem -key key.pem -www
+  -quiet`, or a short python `ssl` server) are enough — the assertion is on the client's
+  exit code:
+  * `build/oj --verify=no GET https://127.0.0.1:<PORT>/` → exit 0 (the control).
+  * `build/oj --verify=no --ciphers=NOT-A-REAL-CIPHER GET https://127.0.0.1:<PORT>/` →
+    pre-fix exit 0 with the body printed (the option was ignored); post-fix exit 1 with a
+    TLS failure on stderr.
+* **SF-001 (cross-host cookie).** Two plain-HTTP listeners: an origin on `127.0.0.1:P1` that
+  answers every request with `302` and `Location: http://127.0.0.2:P2/landing`, and a sink on
+  `127.0.0.2:P2` that records the headers it receives. Put a session file at
+  `$HTTPIE_CONFIG_DIR/sessions/127.0.0.1_<P1>/probe.json` holding one host-only cookie for
+  `127.0.0.1` (the shape of `tests/fixtures/sessions/cap-cookie.json`) and run
+  `build/oj --session=probe --follow -p Hh GET http://127.0.0.1:<P1>/start`. Pre-fix the sink
+  recorded `Cookie: sess=TOPSECRET`; post-fix it records none and the printed hop 2 head has
+  no `Cookie` line, while hop 1 carries it.
+
+### Commit list
+
+`843c96c` docs · `37e9b65` SF-001 · `5452a6b` SF-002 · `2566128` SF-003 · `d003340` SF-004 ·
+`32bc45a` SF-005 · `c0b8f84` SF-001's rendered hop · plus this notes commit. 13 files
+touched, all of them named by the plan (`docs/security-findings.md`, the four SF-001 sources,
+`curl_transport.odin` for SF-002/SF-003, `libcurl.odin`/`types.odin`/`context.odin` for
+SF-003, `store.odin` for SF-004, and the four test files) — no unrelated file changed.
