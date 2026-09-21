@@ -227,6 +227,7 @@ run :: proc(ctx: ^Context) -> int {
 			if !write_hop_messages(
 				ctx,
 				&request,
+				has_session ? &session : nil,
 				request.follow_history,
 				parts_request,
 				parts_response,
@@ -289,6 +290,7 @@ run :: proc(ctx: ^Context) -> int {
 		if !write_hop_messages(
 			ctx,
 			&request,
+			has_session ? &session : nil,
 			response.history,
 			parts_request,
 			parts_response,
@@ -326,13 +328,18 @@ run :: proc(ctx: ^Context) -> int {
 // first, the reply that led to it (only with --all) followed by its request.
 // The first hop's request was already written before the send; the final reply
 // is the caller's, written after this. `prev_with_body` carries httpie's
-// separator state in and out (core.py:214-232). False when a message stopped the
-// run — a charset the registry has no text codec for — which the caller reports
-// after the fact, since the reference's raise unwinds out of the message loop.
+// separator state in and out (core.py:214-232). `session` is the loaded session
+// (nil when the run has none), which every followed hop's `Cookie` header is
+// re-derived from: the request's own copy was built for the first URL only,
+// exactly as the transport re-derives the one it sends (http.Cookie_Hook).
+// False when a message stopped the run — a charset the registry has no text
+// codec for — which the caller reports after the fact, since the reference's
+// raise unwinds out of the message loop.
 @(private)
 write_hop_messages :: proc(
 	ctx: ^Context,
 	first_request: ^http.Request,
+	session: ^Session,
 	history: []http.Exchange,
 	parts_request: output.Parts,
 	parts_response: output.Parts,
@@ -379,7 +386,7 @@ write_hop_messages :: proc(
 			}
 			prev_with_body^ = parts_response.body
 		}
-		write_hop_request(ctx, first_request, history[i], purged, parts_request, base_defaults, config, prev_with_body)
+		write_hop_request(ctx, first_request, session, history[i], purged, parts_request, base_defaults, config, prev_with_body)
 		if charset_failure(ctx, config) {
 			return false
 		}
@@ -418,6 +425,7 @@ write_hop_messages :: proc(
 write_hop_request :: proc(
 	ctx: ^Context,
 	first_request: ^http.Request,
+	session: ^Session,
 	hop: http.Exchange,
 	purged: bool,
 	parts: output.Parts,
@@ -457,23 +465,48 @@ write_hop_request :: proc(
 	}
 
 	keep_body := !purged
-	headers := first_request.headers
-	// The filtered list has to outlive the branch that builds it: the renderer
+	// The hop's head is the request's own headers minus the two things the
+	// reference takes off a followed redirect: the purged body headers, and
+	// `Cookie` — requests pops that one on *every* followed hop and then
+	// re-derives it from the jar for the new URL (sessions.py:235-243). The
+	// re-derived line is appended below, where the hop's target is known.
+	// The filtered list has to outlive the block that builds it: the renderer
 	// reads it below.
-	filtered: [dynamic]http.Header
-	if !keep_body {
-		filtered = make([dynamic]http.Header, 0, len(first_request.headers), allocator)
-		for header in first_request.headers {
-			if strings.equal_fold(header.name, "Content-Length") ||
-			   strings.equal_fold(header.name, "Content-Type") ||
-			   strings.equal_fold(header.name, "Transfer-Encoding") {
-				continue
-			}
-			append(&filtered, header)
+	filtered := make([dynamic]http.Header, 0, len(first_request.headers) + 1, allocator)
+	for header in first_request.headers {
+		if strings.equal_fold(header.name, "Cookie") {
+			continue
 		}
-		headers = filtered[:]
+		if !keep_body &&
+		   (strings.equal_fold(header.name, "Content-Length") ||
+			   strings.equal_fold(header.name, "Content-Type") ||
+			   strings.equal_fold(header.name, "Transfer-Encoding")) {
+			continue
+		}
+		append(&filtered, header)
 	}
 	defer delete(filtered)
+
+	// The `Cookie` this hop is sent with, re-derived from the jar for *its* URL
+	// — requests' `prepare_cookies`, after `resolve_redirects` popped the first
+	// URL's header. A refused target is never sent and gets no line: the branch
+	// above returned the target no mounted adapter can carry.
+	if !refused && session != nil {
+		request_path := target.path
+		if request_path == "" {
+			request_path = "/"
+		}
+		value := session_cookie_value(session, target.host, request_path, target.scheme == .HTTPS, allocator)
+		defer if value != "" {
+			delete(value, allocator)
+		}
+		if value != "" {
+			append(&filtered, http.Header{name = "Cookie", value = value})
+		}
+	}
+	// The list the renderer reads: the filtered headers, with the re-derived
+	// `Cookie` last — the position requests' own dict assignment gives it.
+	headers := filtered[:]
 
 	hop_request := first_request^
 	hop_request.method = hop.method
@@ -934,6 +967,7 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 	request.cert_key = options.cert_key
 	request.cert_key_pass = options.cert_key_pass
 	request.ca_bundle = verify_ca_bundle(options.verify)
+	request.ciphers = options.ciphers
 	if options.auth != "" {
 		if err := http.request_set_auth(request, options.auth, auth_type_of(options.auth_type)); err != .None {
 			return request_failure(ctx, err)
@@ -1000,6 +1034,9 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 	// session's jar *is* the httpie session's), so the header joins after
 	// httpie's defaults and before the head is ordered.
 	session_apply_cookies(session, request)
+	// The same jar re-derives that header for every followed hop: a redirect
+	// must not replay the first URL's cookie (http.Cookie_Hook, SF-001).
+	session_cookie_hook(session, request)
 	// The order comes from the headers' provenance, not their names: the
 	// session is the only layer that knows which of them httpie's request dict
 	// carried (see request_own_names and output.order_request_headers).

@@ -359,6 +359,10 @@ Options :: struct {
 	follow:         bool,
 	max_redirects:  int,
 	verify:         string, // "" = the httpie default ("yes"); else no/false/yes/true/<path>
+	// ciphers is `--ciphers`: OpenSSL's cipher-list grammar (or a TLS 1.3
+	// ciphersuite list). It is owned here and handed to the transport, which
+	// applies it with CURLOPT_SSL_CIPHER_LIST.
+	ciphers:        string,
 	proxy:          [dynamic]string, // --proxy, repeatable
 	cert:           string,
 	cert_key:       string,
@@ -470,6 +474,7 @@ options_destroy :: proc(opts: ^Options) {
 	delete(opts.raw_body, opts.allocator)
 	delete(opts.boundary, opts.allocator)
 	delete(opts.verify, opts.allocator)
+	delete(opts.ciphers, opts.allocator)
 	delete(opts.cert, opts.allocator)
 	delete(opts.cert_key, opts.allocator)
 	delete(opts.cert_key_pass, opts.allocator)

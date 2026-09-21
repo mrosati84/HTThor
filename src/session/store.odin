@@ -38,10 +38,16 @@ SESSIONS_DIR_NAME :: "sessions"
 
 // SESSION_DIR_MODE is the mode of the directories `save()` creates
 // (`mkdir(mode=0o700, parents=True, exist_ok=True)`, config.py:103-104) and
-// SESSION_FILE_MODE the mode of the file itself — the reference writes the
-// file 0644 under umask 022, so matching it means not tightening it here.
+// SESSION_FILE_MODE the mode of the file itself.
+//
+// The file mode is a deliberate divergence from the reference: httpie writes
+// the file 0644 under umask 022 and relies on the 0700 directory to contain it,
+// while the file holds a plaintext credential (`"raw_auth": "alice:s3cr3t"`) and
+// nothing else in it needs to be group- or world-readable. 0600 is what this
+// port writes and re-asserts on save (session_save); do not "restore parity"
+// by widening it back (docs/security-findings.md, SF-004).
 SESSION_DIR_MODE :: os.Permissions{.Read_User, .Write_User, .Execute_User}
-SESSION_FILE_MODE :: os.Permissions{.Read_User, .Write_User, .Read_Group, .Read_Other}
+SESSION_FILE_MODE :: os.Permissions{.Read_User, .Write_User}
 
 // Cookie is one entry of the jar: requests' cookie-jar shape, i.e.
 // sessions.py:33-46's KEPT_COOKIE_OPTIONS plus the state that decides which
@@ -808,7 +814,16 @@ session_save :: proc(session: ^Session) -> bool {
 		transmute([]u8)text,
 		SESSION_FILE_MODE,
 	)
-	return write_err == nil
+	if write_err != nil {
+		return false
+	}
+	// The mode `write_entire_file_from_bytes` was given only applies when the
+	// file is *created*, so a session an older build (or httpie) wrote keeps its
+	// 0644 until this line: SESSION_FILE_MODE is re-asserted on every save. The
+	// failure is not fatal — the data is written and the hardening is
+	// best-effort (the file is contained by its 0700 directory either way).
+	_ = os.chmod(session.path, SESSION_FILE_MODE)
+	return true
 }
 
 // parent_directory is `path.parent` for a path with at least one separator.

@@ -685,6 +685,11 @@ Hop :: struct {
 	// back on a later hop, because each hop's prepared request is a copy of
 	// the previous one (sessions.py:204-258).
 	purge_body_headers: bool,
+	// redirect_target is true for every hop the chain followed into: the
+	// request's own `Cookie` header was derived for the *first* URL only and
+	// must be re-derived for this one (requests' resolve_redirects,
+	// sessions.py:235-243).
+	redirect_target: bool,
 }
 
 // method_expects_a_body is the complement of urllib3's
@@ -989,6 +994,14 @@ apply_hop :: proc(
 		if !hop.keep_authorization && strings.equal_fold(header.name, "Authorization") {
 			skip = true
 		}
+		// requests pops `Cookie` on every followed redirect and re-derives it
+		// from the merged jar for the new URL (sessions.py:235-243). The header
+		// this request carries was built for the *first* URL only, so it is
+		// never replayed onto a hop the chain followed into; the re-derived
+		// value is appended after the loop, where this hop's URL is known.
+		if hop.redirect_target && strings.equal_fold(header.name, "Cookie") {
+			skip = true
+		}
 		if skip {
 			continue
 		}
@@ -1074,6 +1087,34 @@ apply_hop :: proc(
 		slist^ = curl_slist_append(slist^, entry)
 		if slist^ == nil {
 			return .Out_Of_Memory
+		}
+	}
+	// The `Cookie` a followed hop carries, re-derived from the jar for its own
+	// URL. requests' own order: `resolve_redirects` pops the header and
+	// `prepare_cookies` puts it back at the end of the head (sessions.py:235-243),
+	// so the line closes the request's own headers and the Digest answer below
+	// still comes after it. No hook (no session in this run) or an empty value
+	// appends nothing — the reference sends a followed hop no cookie its jar
+	// does not supply for that URL.
+	if hop.redirect_target && req.cookie_hook.value != nil {
+		value := req.cookie_hook.value(req.cookie_hook.data, hop.url, req.allocator)
+		defer if value != "" {
+			delete(value, req.allocator)
+		}
+		if value != "" {
+			line, line_err := strings.concatenate({"Cookie: ", value}, req.allocator)
+			if line_err != .None {
+				return .Out_Of_Memory
+			}
+			entry, entry_ok := c_strings_add(c_strings, line)
+			delete(line, req.allocator)
+			if !entry_ok {
+				return .Out_Of_Memory
+			}
+			slist^ = curl_slist_append(slist^, entry)
+			if slist^ == nil {
+				return .Out_Of_Memory
+			}
 		}
 	}
 	// The Digest answer, last — which is where requests puts it: the header is
@@ -1173,7 +1214,9 @@ url_parts :: proc(url: string) -> Url_Parts {
 // should_strip_authorization is requests' should_strip_auth: the credentials do
 // not follow a redirect to another host, another port or another scheme. The
 // one exception the reference makes is an upgrade from http to https on the
-// same host, which keeps them.
+// same host — on their *standard* ports — and requests evaluates it before any
+// default-port normalisation, so the order below is the reference's
+// (sessions.py:128-158).
 should_strip_authorization :: proc(old_url: string, new_url: string) -> bool {
 	if strings.equal_fold(old_url, new_url) {
 		return false
@@ -1183,15 +1226,24 @@ should_strip_authorization :: proc(old_url: string, new_url: string) -> bool {
 	if !strings.equal_fold(old.host, new.host) {
 		return true
 	}
-	old_port := old.port != 0 ? old.port : (strings.equal_fold(old.scheme, "https") ? 443 : 80)
-	new_port := new.port != 0 ? new.port : (strings.equal_fold(new.scheme, "https") ? 443 : 80)
-	if old_port != new_port {
-		return true
-	}
-	if strings.equal_fold(old.scheme, new.scheme) {
+	// The reference's one exception, evaluated *before* any default-port
+	// normalisation: http (80 or absent) -> https (443 or absent) keeps them
+	// (sessions.py:138-144).
+	if strings.equal_fold(old.scheme, "http") && (old.port == 0 || old.port == 80) &&
+	   strings.equal_fold(new.scheme, "https") && (new.port == 0 || new.port == 443) {
 		return false
 	}
-	return !(strings.equal_fold(old.scheme, "http") && strings.equal_fold(new.scheme, "https"))
+	changed_port := old.port != new.port
+	changed_scheme := !strings.equal_fold(old.scheme, new.scheme)
+	// A same-scheme hop that only spells the default port differently is the same
+	// origin (sessions.py:146-155, `default_port`).
+	default_port := strings.equal_fold(old.scheme, "https") ? 443 : 80
+	if !changed_scheme &&
+	   (old.port == 0 || old.port == default_port) &&
+	   (new.port == 0 || new.port == default_port) {
+		return false
+	}
+	return changed_port || changed_scheme
 }
 
 // transport_send performs the exchange for `req` (already prepared) and fills
@@ -1372,6 +1424,19 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 			return .Out_Of_Memory
 		}
 		if code := setopt_string(handle, CURLOPT_CAINFO, ca_c); code != CURLE_OK {
+			return map_curl_error(code)
+		}
+	}
+	// `--ciphers` is OpenSSL's cipher-list grammar and libcurl hands it to
+	// OpenSSL verbatim: a list the library cannot use fails the handshake with
+	// CURLE_SSL_CIPHER (mapped to .TLS_Failure above), which is the loud failure
+	// the help text promises.
+	if req.ciphers != "" {
+		ciphers_c, ciphers_ok := c_strings_add(&c_strings, req.ciphers)
+		if !ciphers_ok {
+			return .Out_Of_Memory
+		}
+		if code := setopt_string(handle, CURLOPT_SSL_CIPHER_LIST, ciphers_c); code != CURLE_OK {
 			return map_curl_error(code)
 		}
 	}
@@ -1696,6 +1761,7 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 			hop.body_spent = true
 		}
 		hop.keep_authorization = !should_strip_authorization(hop.url, next_url)
+		hop.redirect_target = true
 		hop.method = next_method
 		hop.url = next_url
 		hop.wire_url = next_wire_url

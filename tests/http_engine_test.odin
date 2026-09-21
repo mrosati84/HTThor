@@ -38,7 +38,11 @@ Engine_Server :: struct {
 	listener: net.TCP_Socket,
 	worker:   ^thread.Thread,
 	port:     int,
-	bound:    bool,
+	// address is the loopback address the listener is bound to; the worker is
+	// woken by dialing it on destroy, so the address and not just the port has
+	// to be remembered (a cross-host case binds 127.0.0.2).
+	address: net.IP4_Address,
+	bound:   bool,
 
 	mutex:     sync.Mutex,
 	requests:  [dynamic]string,       // raw bytes of every request, in arrival order
@@ -51,14 +55,22 @@ Engine_Server :: struct {
 // engine_server_start binds 127.0.0.1:0 and starts serving. The listener is
 // bound before the thread runs, so `port` is valid as soon as this returns.
 engine_server_start :: proc(backing: mem.Allocator) -> (server: ^Engine_Server, ok: bool) {
+	return engine_server_start_on(backing, net.IP4_Address { 127, 0, 0, 1 })
+}
+
+// engine_server_start_on is engine_server_start on another loopback address:
+// the cookie cases need a sink that is a different *host* from the redirecting
+// origin (another port keeps cookies, by design).
+engine_server_start_on :: proc(backing: mem.Allocator, address: net.IP4_Address) -> (server: ^Engine_Server, ok: bool) {
 	server = new(Engine_Server, backing)
 	server.backing = backing
 	server.requests = make([dynamic]string, 0, 4, backing)
 	server.replies = make([dynamic]string, 0, 4, backing)
 	server.hold_open = make([dynamic]net.TCP_Socket, 0, 2, backing)
+	server.address = address
 
 	endpoint := net.Endpoint {
-		address = net.Address(net.IP4_Address { 127, 0, 0, 1 }),
+		address = net.Address(address),
 		port    = 0,
 	}
 	listener, listen_err := net.listen_tcp(endpoint)
@@ -99,7 +111,7 @@ engine_server_destroy :: proc(server: ^Engine_Server) {
 		// return, see `stop`, and leave. Joining before closing the listener
 		// keeps the worker away from a socket this thread is freeing.
 		if wake, dial_err := net.dial_tcp_from_address_and_port(
-			net.Address(net.IP4_Address { 127, 0, 0, 1 }),
+			net.Address(server.address),
 			server.port,
 		); dial_err == nil {
 			net.close(wake)
@@ -2236,5 +2248,274 @@ test_engine_aborts_a_chain_at_the_redirect_limit :: proc(t: ^testing.T) {
 	http.request_destroy(&request)
 	delete(url, allocator)
 	engine_server_destroy(server)
+	engine_no_leaks(t, &track)
+}
+
+// ---------------------------------------------------------------------------
+// Cookies on a followed redirect (SF-001)
+// ---------------------------------------------------------------------------
+
+// ENGINE_COOKIE_SECRET is the value the stub jar hands a hop it accepts.
+ENGINE_COOKIE_SECRET :: "sess=JARSECRET"
+
+// engine_cookie_hook_state is the stub jar's policy for one case: `prefix` is
+// the URL prefix the cookie was stored for (a host-only cookie goes back to its
+// own host alone) and `path_ok` is the path rule's answer for the target.
+engine_cookie_hook_state :: struct {
+	prefix:  string,
+	path_ok: bool,
+}
+
+// engine_cookie_hook_value is a stub http.Cookie_Hook.value: it answers the way
+// the session's jar would — the secret for a URL it accepts, "" for one whose
+// host or path the policy rejects — so the cases below can tell a re-derived
+// header from a replayed one.
+engine_cookie_hook_value :: proc(data: rawptr, url: string, allocator: mem.Allocator) -> string {
+	state := (^engine_cookie_hook_state)(data)
+	if !state.path_ok || !strings.has_prefix(url, state.prefix) {
+		return ""
+	}
+	return strings.clone(ENGINE_COOKIE_SECRET, allocator) or_else ""
+}
+
+// engine_redirect_reply is a 302 whose Location is `target`, owned by the caller.
+engine_redirect_reply :: proc(target: string, allocator: mem.Allocator) -> string {
+	return fmt.aprintf(
+		"HTTP/1.1 302 Found\r\nLocation: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+		target,
+		allocator = allocator,
+	)
+}
+
+// engine_cookie_redirect runs one followed exchange from `origin`: `reply` is
+// the origin's canned answer (whose Location names the sink), `cookie_header`
+// is the `Cookie:` item the request carries ("" for none) and `hook` the jar
+// the request carries (the zero value for none). Reports false when the
+// exchange did not complete, in which case the caller asserts nothing.
+engine_cookie_redirect :: proc(
+	t: ^testing.T,
+	origin: ^Engine_Server,
+	reply: string,
+	cookie_header: string,
+	hook: http.Cookie_Hook,
+	allocator: mem.Allocator,
+) -> bool {
+	engine_queue_reply(origin, reply)
+	url := engine_url(origin, "/first", allocator)
+	defer delete(url, allocator)
+	request, create_err := http.request_create(allocator, .GET, url, nil)
+	if create_err != .None {
+		testing.expectf(t, false, "request_create: %v", create_err)
+		return false
+	}
+	defer http.request_destroy(&request)
+	request.follow_redirects = true
+	request.max_redirects = 5
+	request.cookie_hook = hook
+	if cookie_header != "" {
+		testing.expect_value(t, http.request_add_header(&request, "Cookie", cookie_header), http.Error.None)
+	}
+
+	response: http.Response
+	defer http.response_destroy(&response)
+	send_err := engine_send(t, &request, &response)
+	if send_err != .None {
+		testing.expectf(t, false, "the followed exchange failed: %v", send_err)
+		return false
+	}
+	return true
+}
+
+// engine_cookie_of is the `Cookie` header of the index-th request a server
+// captured, and whether that line is there at all. The clone it reads through
+// is released here.
+engine_cookie_of :: proc(server: ^Engine_Server, index: int, allocator: mem.Allocator) -> (value: string, found: bool) {
+	raw, ok := engine_request_clone(server, index, allocator)
+	if !ok {
+		return "", false
+	}
+	defer delete(raw, allocator)
+	return engine_header_of(raw, "Cookie")
+}
+
+// SF-001: the `Cookie` header a request is built with belongs to the *first*
+// URL. requests pops it on every followed redirect and re-derives it from the
+// merged jar for the new URL (sessions.py:235-243), so a cross-host hop carries
+// no cookie, a same-host/other-port hop carries the jar's, and the first URL's
+// header is never replayed. Every assertion below is on the bytes a listener
+// actually captured.
+@(test)
+test_engine_rebuilds_the_cookie_header_on_a_redirect :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	// The redirecting origin, a sink on another *host* (127.0.0.2), and a
+	// second listener on the origin's own host but another port: a port change
+	// keeps cookies, by design, so only a host change may drop them.
+	origin, origin_started := engine_server_start(backing)
+	testing.expect(t, origin_started, "the origin server must start")
+	sink, sink_started := engine_server_start_on(backing, net.IP4_Address { 127, 0, 0, 2 })
+	testing.expect(t, sink_started, "the cross-host sink must start")
+	neighbour, neighbour_started := engine_server_start(backing)
+	testing.expect(t, neighbour_started, "the same-host listener must start")
+
+	if origin_started && sink_started && neighbour_started {
+		cross_host := fmt.aprintf("http://127.0.0.2:%d/landing", sink.port, allocator = allocator)
+		same_host := engine_url(neighbour, "/landing", allocator)
+		defer delete(cross_host, allocator)
+		defer delete(same_host, allocator)
+
+		// Case 1: no jar in the run, a `Cookie:` item on the request. The
+		// followed hop must not see it; the first hop must still carry it
+		// unchanged.
+		reply := engine_redirect_reply(cross_host, allocator)
+		if engine_cookie_redirect(t, origin, reply, "item=1", {}, allocator) {
+			value, has_cookie := engine_cookie_of(origin, 0, allocator)
+			testing.expectf(t, has_cookie && value == "item=1", "hop 1 must carry the item's Cookie, got %q", value)
+			_, hop2_cookie := engine_cookie_of(sink, 0, allocator)
+			testing.expect(t, !hop2_cookie, "a cross-host hop must not carry the first URL's Cookie")
+		}
+		delete(reply, allocator)
+
+		state := engine_cookie_hook_state {
+			prefix  = "http://127.0.0.1:",
+			path_ok = true,
+		}
+		hook := http.Cookie_Hook {
+			data  = rawptr(&state),
+			value = engine_cookie_hook_value,
+		}
+
+		// Case 2: the same cross-host 302, with a jar stub that accepts the
+		// origin's host only. The hop is the other host, so the stub answers ""
+		// and no line goes out.
+		reply = engine_redirect_reply(cross_host, allocator)
+		if engine_cookie_redirect(t, origin, reply, "item=1", hook, allocator) {
+			_, hop2_cookie := engine_cookie_of(sink, 1, allocator)
+			testing.expect(t, !hop2_cookie, "the jar refused this host: no Cookie line may go out")
+		}
+		delete(reply, allocator)
+
+		// Case 3: the same stub, a 302 to the same host on another port. The
+		// stub accepts it, so the hop carries the jar's value — and not the
+		// first URL's item.
+		reply = engine_redirect_reply(same_host, allocator)
+		if engine_cookie_redirect(t, origin, reply, "item=1", hook, allocator) {
+			value, has_cookie := engine_cookie_of(neighbour, 0, allocator)
+			testing.expectf(
+				t,
+				has_cookie && value == ENGINE_COOKIE_SECRET,
+				"a same-host hop must carry the jar's Cookie, got %q",
+				value,
+			)
+		}
+		delete(reply, allocator)
+
+		// Case 4: the stub rejects the path (what a `Path` rule outside the
+		// target answers). The hop gets no line at all.
+		state.path_ok = false
+		reply = engine_redirect_reply(same_host, allocator)
+		if engine_cookie_redirect(t, origin, reply, "item=1", hook, allocator) {
+			_, hop2_cookie := engine_cookie_of(neighbour, 1, allocator)
+			testing.expect(t, !hop2_cookie, "the jar's path rule rejected the hop: no Cookie line may go out")
+		}
+		delete(reply, allocator)
+	}
+
+	engine_server_destroy(neighbour)
+	engine_server_destroy(sink)
+	engine_server_destroy(origin)
+	engine_no_leaks(t, &track)
+}
+
+// ENGINE_AUTHORIZATION is `Basic alice:s3cr3t`, the credential line the SF-002
+// cases put on the request.
+ENGINE_AUTHORIZATION :: "Basic YWxpY2U6czNjcjN0"
+
+// SF-002: `Authorization` follows a redirect that stays on the origin and is
+// dropped when the origin changes (requests' should_strip_auth, sessions.py:
+// 128-158). Part (a) is the request-relative Location that stays on the origin;
+// part (b) is the same host on another port, where the second listener's bytes
+// are the only witness — and the case a fail-open rewrite would leak through.
+@(test)
+test_engine_keeps_and_strips_authorization_across_a_redirect :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	origin, origin_started := engine_server_start(backing)
+	testing.expect(t, origin_started, "the origin server must start")
+	other, other_started := engine_server_start(backing)
+	testing.expect(t, other_started, "the other-origin listener must start")
+
+	if origin_started && other_started {
+		start_url := engine_url(origin, "/start", allocator)
+		defer delete(start_url, allocator)
+
+		// (a) `Location: /next` is the same origin, so the credentials stay.
+		engine_queue_reply(origin, "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		request, create_err := http.request_create(allocator, .GET, start_url, nil)
+		testing.expect_value(t, create_err, http.Error.None)
+		if create_err == .None {
+			request.follow_redirects = true
+			request.max_redirects = 5
+			testing.expect_value(
+				t,
+				http.request_add_header(&request, "Authorization", ENGINE_AUTHORIZATION),
+				http.Error.None,
+			)
+			response: http.Response
+			if engine_send(t, &request, &response) == .None {
+				second := engine_request_clone(origin, 1, allocator) or_else ""
+				value, has_authorization := engine_header_of(second, "Authorization")
+				testing.expectf(
+					t,
+					has_authorization && value == ENGINE_AUTHORIZATION,
+					"a same-origin hop must keep Authorization, got %q",
+					value,
+				)
+				delete(second, allocator)
+			}
+			http.response_destroy(&response)
+			http.request_destroy(&request)
+		}
+
+		// (b) an absolute Location on another port is another origin, so the
+		// credentials do not go out.
+		target := engine_url(other, "/landing", allocator)
+		reply := engine_redirect_reply(target, allocator)
+		delete(target, allocator)
+		engine_queue_reply(origin, reply)
+		delete(reply, allocator)
+
+		request_b, create_err_b := http.request_create(allocator, .GET, start_url, nil)
+		testing.expect_value(t, create_err_b, http.Error.None)
+		if create_err_b == .None {
+			request_b.follow_redirects = true
+			request_b.max_redirects = 5
+			testing.expect_value(
+				t,
+				http.request_add_header(&request_b, "Authorization", ENGINE_AUTHORIZATION),
+				http.Error.None,
+			)
+			response_b: http.Response
+			if engine_send(t, &request_b, &response_b) == .None {
+				landing := engine_request_clone(other, 0, allocator) or_else ""
+				_, has_authorization := engine_header_of(landing, "Authorization")
+				testing.expect(t, !has_authorization, "an origin-changing hop must not carry Authorization")
+				delete(landing, allocator)
+			}
+			http.response_destroy(&response_b)
+			http.request_destroy(&request_b)
+		}
+	}
+
+	engine_server_destroy(other)
+	engine_server_destroy(origin)
 	engine_no_leaks(t, &track)
 }

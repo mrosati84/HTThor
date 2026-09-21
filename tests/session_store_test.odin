@@ -13,6 +13,7 @@ package tests
 
 import "core:fmt"
 import "core:mem"
+import "core:net"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -35,8 +36,10 @@ SESSION_CAPTURE_DIR :: "tests/fixtures/sessions"
 
 // The file oj writes for `--session=cap1` must be the reference's file, byte
 // for byte: same key order (sort_keys puts `__meta__` first), same four-space
-// indentation, same trailing newline — and the same 0700 directory / 0644 file
-// modes the reference produces.
+// indentation, same trailing newline — and the same 0700 directory. The file
+// mode is the port's own 0600 rather than the reference's 0644: a deliberate
+// divergence, recorded at SESSION_FILE_MODE (store.odin) and in
+// docs/security-findings.md SF-004.
 @(test)
 test_session_cap1_file_matches_the_reference_capture :: proc(t: ^testing.T) {
 	backing := context.allocator
@@ -98,8 +101,9 @@ test_session_cap1_file_matches_the_reference_capture :: proc(t: ^testing.T) {
 		)
 	}
 
-	// The reference's own modes: `mkdir(mode=0o700)` for the directory and the
-	// default 0644 for the file.
+	// The reference's own directory mode (`mkdir(mode=0o700)`), and the port's
+	// file mode: 0600, a deliberate divergence from the reference's 0644
+	// (SESSION_FILE_MODE, store.odin; docs/security-findings.md SF-004).
 	directory, directory_err := os.stat(
 		fmt.aprintf(
 			"%s/config/sessions/127.0.0.1_8765",
@@ -127,8 +131,69 @@ test_session_cap1_file_matches_the_reference_capture :: proc(t: ^testing.T) {
 	if file_err == nil {
 		testing.expectf(
 			t,
-			file.mode == os.Permissions{.Read_User, .Write_User, .Read_Group, .Read_Other},
-			"session file mode is %v, want 0644",
+			file.mode == os.Permissions{.Read_User, .Write_User},
+			"session file mode is %v, want 0600",
+			file.mode,
+		)
+	}
+
+	session_teardown(sandbox, &out, &err_out, allocator)
+	expect_no_leaks(t, &track)
+}
+
+// A session file an older build (or httpie) left at 0644 is tightened by the
+// next save: the mode argument of `write_entire_file_from_bytes` only applies
+// when the file is created, so session_save chmods afterwards (SF-004). Red
+// with the constant alone, green with the chmod.
+@(test)
+test_session_save_tightens_an_existing_0644_file :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+	defer free_all(context.temp_allocator)
+
+	sandbox := session_sandbox(t, "tighten", allocator)
+
+	out, err_out: strings.Builder
+	strings.builder_init(&out, allocator)
+	strings.builder_init(&err_out, allocator)
+
+	// The same offline write the cap1 case makes, with the file already there
+	// and world-readable — the state a 3.2-era oj or httpie leaves behind.
+	session_seed(t, sandbox, "cap1.json", "cap1.json")
+	path := fmt.aprintf(
+		"%s/config/sessions/127.0.0.1_8765/cap1.json",
+		sandbox,
+		allocator = context.temp_allocator,
+	)
+	testing.expectf(
+		t,
+		os.chmod(path, os.Permissions{.Read_User, .Write_User, .Read_Group, .Read_Other}) == nil,
+		"cannot widen %s to 0644 for the test",
+		path,
+	)
+
+	argv := []string{
+		"oj",
+		"--session=cap1",
+		"--offline",
+		"-p", "hb",
+		"--pretty=none",
+		"POST", "http://127.0.0.1:8765/echo",
+		"a=1",
+	}
+	exit_code := run_session(t, argv, sandbox, &out, &err_out, allocator)
+	testing.expect_value(t, exit_code, int(cli.Exit_Code.Ok))
+
+	file, file_err := os.stat(path, context.temp_allocator)
+	testing.expectf(t, file_err == nil, "cannot stat the session file: %v", file_err)
+	if file_err == nil {
+		testing.expectf(
+			t,
+			file.mode == os.Permissions{.Read_User, .Write_User},
+			"a 0644 session file must be tightened on save, mode is %v",
 			file.mode,
 		)
 	}
@@ -354,6 +419,180 @@ test_session_cookie_jar_replays_a_set_cookie :: proc(t: ^testing.T) {
 			string(want),
 			string(written),
 		)
+	}
+
+	session.session_destroy(&session_instance)
+	session_teardown(sandbox, &out, &err_out, allocator)
+	expect_no_leaks(t, &track)
+}
+
+// The rendered half of SF-001: a followed hop's printed head must show what the
+// wire sends. requests pops the first URL's `Cookie` and re-derives it from the
+// jar for the new URL, so a cross-host hop prints no `Cookie` line at all while
+// the first request prints the jar's — the same rule write_hop_request applies
+// to the transport's (session_cookie_hook). The listeners' bytes are asserted
+// too, so the render and the wire cannot drift apart.
+@(test)
+test_session_renders_no_cookie_on_a_cross_host_hop :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+	defer free_all(context.temp_allocator)
+
+	origin, origin_started := engine_server_start(backing)
+	testing.expect(t, origin_started, "the origin server must start")
+	sink, sink_started := engine_server_start_on(backing, net.IP4_Address { 127, 0, 0, 2 })
+	testing.expect(t, sink_started, "the cross-host sink must start")
+	if !origin_started || !sink_started {
+		engine_server_destroy(sink)
+		engine_server_destroy(origin)
+		expect_no_leaks(t, &track)
+		return
+	}
+
+	sandbox := session_sandbox(t, "render-cookie", allocator)
+	out, err_out: strings.Builder
+	strings.builder_init(&out, allocator)
+	strings.builder_init(&err_out, allocator)
+
+	// The reference's own cookie file, in the directory this origin's
+	// host and port map to (`<host>_<port>`, store.odin's session_host_dir).
+	session_seed_in_host_dir(
+		t,
+		sandbox,
+		fmt.aprintf("127.0.0.1_%d", origin.port, allocator = context.temp_allocator),
+		"cap-cookie.json",
+		"cap-cookie.json",
+	)
+
+	target := fmt.aprintf("http://127.0.0.2:%d/landing", sink.port, allocator = allocator)
+	reply := engine_redirect_reply(target, allocator)
+	engine_queue_reply(origin, reply)
+	delete(reply, allocator)
+	delete(target, allocator)
+
+	url := engine_url(origin, "/start", allocator)
+	argv := []string{
+		"oj",
+		"--session=cap-cookie",
+		"--follow",
+		"--pretty=none",
+		"-p", "Hh",
+		url,
+	}
+	exit_code := run_session(t, argv, sandbox, &out, &err_out, allocator)
+	testing.expect_value(t, exit_code, int(cli.Exit_Code.Ok))
+
+	rendered := strings.to_string(out)
+	testing.expectf(
+		t,
+		strings.count(rendered, "Cookie: BODY=deterministic-cookie") == 1,
+		"the jar's Cookie belongs to the first request only:\n%s",
+		rendered,
+	)
+	origin_cookie, origin_has := engine_cookie_of(origin, 0, allocator)
+	testing.expectf(
+		t,
+		origin_has && origin_cookie == "BODY=deterministic-cookie",
+		"the origin must have received the jar's cookie, got %q",
+		origin_cookie,
+	)
+	_, sink_has := engine_cookie_of(sink, 0, allocator)
+	testing.expect(t, !sink_has, "the cross-host hop must not carry the jar's Cookie")
+
+	// Everything the tracking allocator is owed is released before the leak
+	// check, which is why these are explicit and not deferred (the file's
+	// other cases do the same).
+	delete(url, allocator)
+	engine_server_destroy(sink)
+	engine_server_destroy(origin)
+	session_teardown(sandbox, &out, &err_out, allocator)
+	expect_no_leaks(t, &track)
+}
+
+// session_cookie_value is the jar's policy in one call — the rule a followed
+// hop's `Cookie` header is re-derived through (http.Cookie_Hook, SF-001) — so it
+// is pinned directly here as well as on the wire.
+@(test)
+test_session_cookie_value_respects_domain_path_and_secure :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+	defer free_all(context.temp_allocator)
+
+	sandbox := session_sandbox(t, "cookie-value", allocator)
+
+	out, err_out: strings.Builder
+	strings.builder_init(&out, allocator)
+	strings.builder_init(&err_out, allocator)
+
+	argv := []string{
+		"oj",
+		"--session=cookie-value",
+		"--offline",
+		"-p", "h",
+		"--pretty=none",
+		"http://example.com/echo",
+	}
+	options, parse_err := session_options(t, argv, sandbox, allocator)
+	testing.expect_value(t, parse_err.kind, cli.Parse_Error_Kind.None)
+	session_instance, opened := session.session_open(&options, output.Console{writer = strings.to_writer(&err_out), width = cli.RICH_WIDTH}, allocator)
+	cli.options_destroy(&options)
+	testing.expectf(t, opened, "the session could not be opened: %s", strings.to_string(err_out))
+	if !opened {
+		session_teardown(sandbox, &out, &err_out, allocator)
+		expect_no_leaks(t, &track)
+		return
+	}
+
+	// One host-only Secure cookie under /private, one plain cookie under
+	// /public, and one plain cookie for every path — the three together pin the
+	// domain, the path and the Secure rule, and the longest-path-first order.
+	// The host is a name, not a loopback address: `is_local_host` keeps a Secure
+	// cookie travelling over plain http to localhost, which would hide the
+	// Secure rule below.
+	response := http.Response {
+		status  = 200,
+		headers = []http.Header {
+			{name = "Set-Cookie", value = "SESS=JARSECRET; Path=/private; Secure"},
+			{name = "Set-Cookie", value = "PLAIN=1; Path=/public"},
+			{name = "Set-Cookie", value = "ROOT=1; Path=/"},
+		},
+		url = "http://example.com/echo",
+	}
+	session.session_collect_cookies(&session_instance, &response)
+	testing.expectf(t, len(session_instance.cookies) == 3, "the jar holds %d cookies", len(session_instance.cookies))
+
+	cases := [?]struct {
+		what:   string,
+		host:   string,
+		path:   string,
+		secure: bool,
+		want:   string,
+	}{
+		{"the stored host, the Secure cookie's own path, https", "example.com", "/private", true, "SESS=JARSECRET; ROOT=1"},
+		{"a path below the cookie's own is a match", "example.com", "/private/x", true, "SESS=JARSECRET; ROOT=1"},
+		{"a Secure cookie over plain http", "example.com", "/private", false, "ROOT=1"},
+		{"a path outside the cookie's own", "example.com", "/other", true, "ROOT=1"},
+		{"the whole host", "example.com", "/", true, "ROOT=1"},
+		{"the other cookie's path", "example.com", "/public", false, "PLAIN=1; ROOT=1"},
+		{"another host", "other.example.com", "/private", true, ""},
+		{"another host, any path", "other.example.com", "/", true, ""},
+	}
+	for test_case in cases {
+		value := session.session_cookie_value(
+			&session_instance,
+			test_case.host,
+			test_case.path,
+			test_case.secure,
+			allocator,
+		)
+		testing.expectf(t, value == test_case.want, "%s: got %q, want %q", test_case.what, value, test_case.want)
+		delete(value, allocator)
 	}
 
 	session.session_destroy(&session_instance)

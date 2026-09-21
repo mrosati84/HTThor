@@ -118,6 +118,10 @@ CURLOPT_SSLCERT :: CURLoption(10025)
 CURLOPT_HEADERDATA :: CURLoption(10029)
 CURLOPT_CUSTOMREQUEST :: CURLoption(10036)
 CURLOPT_CAINFO :: CURLoption(10065)
+// `--ciphers`: the option is CURLOPTTYPE_STRINGPOINT + 83, verified against
+// libcurl 8.5.0 with curl_easy_option_by_name — the same run-time check
+// tests/libcurl_test.odin makes.
+CURLOPT_SSL_CIPHER_LIST :: CURLoption(10083)
 CURLOPT_SSLKEY :: CURLoption(10087)
 CURLOPT_ACCEPT_ENCODING :: CURLoption(10102)
 CURLOPT_KEYPASSWD :: CURLoption(10026)
