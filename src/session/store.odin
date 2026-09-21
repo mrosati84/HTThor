@@ -146,7 +146,7 @@ session_open :: proc(
 	session.allocator = allocator
 	session.read_only = options.session == ""
 
-	location, located := session_location(options, allocator)
+	location, located := session_location(options, log, allocator)
 	if !located {
 		message := "ConfigFileError: unable to resolve the HTTPie config directory (is HOME set?)"
 		output.write_log_error(log, options.program_name, message)
@@ -203,6 +203,7 @@ Session_Location :: struct {
 @(private)
 session_location :: proc(
 	options: ^cli.Options,
+	log: output.Console,
 	allocator: mem.Allocator,
 ) -> (
 	location: Session_Location,
@@ -218,20 +219,35 @@ session_location :: proc(
 	// and it has to outlive *this* statement, which is why the release is
 	// registered at function scope (a `defer` inside the `if` would run as the
 	// block ended, while `bound` is still read below).
-	bound := session_bound_hostname(options, allocator)
+	bound, bound_ok := session_bound_hostname(options, allocator)
+	if !bound_ok {
+		return location, location_oom(log, options.program_name)
+	}
 	defer delete_bound_hostname(bound, allocator)
 	hostname := bound
 	if hostname == "" {
 		// httpie's HACK/FIXME for URLs without a hostname.
 		hostname = "localhost"
 	}
+	// M5 keep: `clone_before_colon`'s own `false` means two things — a hostname
+	// with nothing before its colon (`:80`) and a copy that could not be made
+	// — and the empty spelling is a legitimate bound host for the reference,
+	// so this site cannot report the copy through `located` (backlog M5).
 	location.bound_host = clone_before_colon(hostname, allocator) or_else ""
 
 	if strings.contains(name, "/") {
 		location.anonymous = true
-		location.path = expand_user_path(options, name, allocator) or_else ""
-		location.session_id = strings.clone(location.path, allocator) or_else ""
-		return location, location.path != ""
+		path, path_ok := expand_user_path(options, name, allocator)
+		if !path_ok {
+			return location, location_oom(log, options.program_name)
+		}
+		location.path = path
+		session_id, id_ok := http.clone_or_oom(name, allocator)
+		if !id_ok {
+			return location, location_oom(log, options.program_name)
+		}
+		location.session_id = session_id
+		return location, true
 	}
 
 	directory, has_directory := config_directory(options.env, allocator)
@@ -240,7 +256,10 @@ session_location :: proc(
 	}
 	defer delete(directory, allocator)
 
-	host_dir := session_host_dir(hostname, allocator)
+	host_dir, host_dir_ok := session_host_dir(hostname, allocator)
+	if !host_dir_ok {
+		return location, location_oom(log, options.program_name)
+	}
 	defer delete(host_dir, allocator)
 	location.path = fmt.aprintf(
 		"%s/%s/%s/%s.json",
@@ -250,8 +269,22 @@ session_location :: proc(
 		name,
 		allocator = allocator,
 	)
-	location.session_id = strings.clone(name, allocator) or_else ""
+	session_id, id_ok := http.clone_or_oom(name, allocator)
+	if !id_ok {
+		return location, location_oom(log, options.program_name)
+	}
+	location.session_id = session_id
 	return location, true
+}
+
+// location_oom reports a copy that could not be made while the session's own
+// path was being resolved: the run cannot go on, and the wording is the one the
+// parser already uses for an allocation failure (backlog M5). Always false, so
+// the caller can `return location, location_oom(...)`.
+@(private)
+location_oom :: proc(log: output.Console, program_name: string) -> bool {
+	output.write_log_error(log, program_name, "not enough memory")
+	return false
 }
 
 // delete_bound_hostname releases a hostname `session_bound_hostname` handed
@@ -268,30 +301,35 @@ delete_bound_hostname :: proc(hostname: string, allocator: mem.Allocator) {
 // `get_httpie_session` puts a named session in: the bound hostname with every
 // `:` replaced by `_` (sessions.py:118, docs/PARITY.md §6.3).
 //
-// The result is *always* an allocation, which is what the caller's `defer
-// delete` needs. `strings.replace_all` answers `(output, was_allocation)` and
-// hands its input back untouched with `was_allocation = false` when there is no
-// `:` to replace (core:strings' own doc: `xyzxyz` -> `xyzxyz false`) — so
-// reading that bool as "did it work" with `or_else` collapses the whole host
-// component of a default-port URL to `""`, and `example.org` becomes the path
-// `sessions//<name>.json` (POSIX collapses the double slash, so the file lands
-// one directory up, where the reference never looks). The borrowed spelling is
-// cloned instead: `hostname` is never empty here (`session_location`'s
-// "localhost" fallback), and a clone of it is the owned string the caller
-// releases.
+// The result is *always* an allocation unless it fails, which is what the
+// caller's `defer delete` needs. `strings.replace_all` answers
+// `(output, was_allocation)` and hands its input back untouched with
+// `was_allocation = false` when there is no `:` to replace (core:strings' own
+// doc: `xyzxyz` -> `xyzxyz false`) — so reading that bool as "did it work" with
+// `or_else` collapses the whole host component of a default-port URL to `""`,
+// and `example.org` becomes the path `sessions//<name>.json` (POSIX collapses
+// the double slash, so the file lands one directory up, where the reference
+// never looks). The borrowed spelling is cloned instead: `hostname` is never
+// empty here (`session_location`'s "localhost" fallback), and a clone of it is
+// the owned string the caller releases.
+//
+// False is the clone's own failure — nothing was allocated — and the caller
+// reports it rather than build the wrong path (backlog M5).
 @(private)
-session_host_dir :: proc(hostname: string, allocator: mem.Allocator) -> string {
+session_host_dir :: proc(hostname: string, allocator: mem.Allocator) -> (string, bool) {
 	replaced, was_allocation := strings.replace_all(hostname, ":", "_", allocator)
 	if was_allocation {
-		return replaced
+		return replaced, true
 	}
-	return strings.clone(hostname, allocator) or_else ""
+	return http.clone_or_oom(hostname, allocator)
 }
 
 // session_bound_hostname is httpie's `host or url_as_host(url)`: the Host
 // header item when the command line carries one, else the URL's netloc with its
 // userinfo stripped (sessions.py:92-95, utils.py:266-267). "" means "the URL
-// has no hostname at all", which get_httpie_session turns into "localhost".
+// has no hostname at all", which get_httpie_session turns into "localhost"; a
+// `false` result is the copy's own failure and is reported by the caller
+// (backlog M5).
 //
 // The item's spelling is read through the item header dict's fold, which is
 // what `args.headers.get('Host')` answers: `False` for a `Host:` the user
@@ -304,7 +342,7 @@ session_host_dir :: proc(hostname: string, allocator: mem.Allocator) -> string {
 // would bind the session — and with it the file's path — to `localhost`
 // (t_f853a088). The fall-through is the loop's `break`, not a `return`.
 @(private)
-session_bound_hostname :: proc(options: ^cli.Options, allocator: mem.Allocator) -> string {
+session_bound_hostname :: proc(options: ^cli.Options, allocator: mem.Allocator) -> (string, bool) {
 	fold := cli.header_fold(&options.item_set, allocator)
 	defer cli.header_fold_destroy(&fold)
 	for entry in fold.entries {
@@ -316,7 +354,7 @@ session_bound_hostname :: proc(options: ^cli.Options, allocator: mem.Allocator) 
 		if entry.unset || len(entry.values) == 0 || entry.values[0].value == "" {
 			break
 		}
-		return strings.clone(entry.values[0].value, allocator) or_else ""
+		return http.clone_or_oom(entry.values[0].value, allocator)
 	}
 
 	return session_url_host(options, allocator)
@@ -339,26 +377,35 @@ session_bound_hostname :: proc(options: ^cli.Options, allocator: mem.Allocator) 
 // answers the whole netloc, so the *joined* `prefix + text` is the host, not
 // `url_split`'s separate `host`/`port`.
 @(private)
-session_url_host :: proc(options: ^cli.Options, allocator: mem.Allocator) -> string {
+session_url_host :: proc(options: ^cli.Options, allocator: mem.Allocator) -> (string, bool) {
 	target, split_err := http.url_split(options.url, options.default_scheme)
 	if split_err != .None {
-		return ""
+		return "", true
 	}
 	joined := http.split_text_join(target.host_port, allocator)
 	if joined == "" {
-		return ""
+		// `split_text_join` answers the netloc itself when there is no prefix
+		// to join, so an empty result there is the URL that names no host at
+		// all — but a join with a prefix is an allocation, and *that* can
+		// fail (`split_text_join`, src/http/url.odin:29-33).
+		return "", target.host_port.prefix == ""
 	}
 	// `split_text_join` allocates only when there is a prefix to join — the
 	// shorthand's `localhost` — and that joined spelling is already the owned
 	// string the caller releases; without one it is a slice of `options.url`
 	// and the caller gets its own copy.
 	if target.host_port.prefix != "" {
-		return joined
+		return joined, true
 	}
-	return strings.clone(joined, allocator) or_else ""
+	return http.clone_or_oom(joined, allocator)
 }
 
 // clone_before_colon is `strip_port`: everything before the first `:`.
+//
+// `false` is either head's own emptiness or a copy that could not be made — the
+// two are indistinguishable to the caller and both mean "no usable head here";
+// the copy itself goes through `clone_or_oom`, so it is never *read* as an
+// empty head by mistake (backlog M5).
 @(private)
 clone_before_colon :: proc(text: string, allocator: mem.Allocator) -> (result: string, ok: bool) {
 	head := text
@@ -368,12 +415,13 @@ clone_before_colon :: proc(text: string, allocator: mem.Allocator) -> (result: s
 	if head == "" {
 		return "", false
 	}
-	clone := strings.clone(head, allocator) or_else ""
-	return clone, clone != ""
+	return http.clone_or_oom(head, allocator)
 }
 
 // expand_user_path is `os.path.expanduser`: `~` becomes $HOME, and a `~user`
-// form that cannot be looked up is left alone.
+// form that cannot be looked up is left alone. `false` is a copy that could not
+// be made (backlog M5); the empty path is a legitimate value and is reported as
+// successful, so the caller's own emptiness checks keep their meaning.
 @(private)
 expand_user_path :: proc(
 	options: ^cli.Options,
@@ -386,13 +434,15 @@ expand_user_path :: proc(
 	if strings.has_prefix(name, "~") {
 		if len(name) == 1 || name[1] == '/' {
 			if home, found := cli.env_get(options.env, "HOME"); found && home != "" {
-				path = strings.concatenate({home, name[1:]}, allocator) or_else ""
-				return path, path != ""
+				expanded, concat_err := strings.concatenate({home, name[1:]}, allocator)
+				if concat_err != .None {
+					return "", false
+				}
+				return expanded, true
 			}
 		}
 	}
-	path = strings.clone(name, allocator) or_else ""
-	return path, path != ""
+	return http.clone_or_oom(name, allocator)
 }
 
 // config_directory is `get_default_config_dir` (config.py:20-58):
@@ -400,6 +450,7 @@ expand_user_path :: proc(
 // ($XDG_CONFIG_HOME or ~/.config)/httpie. The same resolution lives in
 // src/cli/parse.odin, where it is private to that package; this card owns
 // src/session only, so the twenty lines are repeated rather than exported.
+// `false` is a copy that could not be made (backlog M5).
 @(private)
 config_directory :: proc(
 	env: cli.Env_Info,
@@ -409,26 +460,32 @@ config_directory :: proc(
 	ok: bool,
 ) {
 	if value, found := cli.env_get(env, "HTTPIE_CONFIG_DIR"); found && value != "" {
-		directory = strings.clone(value, allocator) or_else ""
-		return directory, directory != ""
+		return http.clone_or_oom(value, allocator)
 	}
 	home, has_home := cli.env_get(env, "HOME")
 	if !has_home || home == "" {
 		return "", false
 	}
-	legacy := strings.concatenate({home, "/.httpie"}, allocator) or_else ""
-	if legacy != "" {
-		if info, stat_err := os.stat(legacy, context.temp_allocator); stat_err == nil && info.type == .Directory {
-			return legacy, true
-		}
+	legacy, legacy_err := strings.concatenate({home, "/.httpie"}, allocator)
+	if legacy_err != .None {
+		return "", false
+	}
+	if info, stat_err := os.stat(legacy, context.temp_allocator); stat_err == nil && info.type == .Directory {
+		return legacy, true
 	}
 	delete(legacy, allocator)
 	if xdg, found := cli.env_get(env, "XDG_CONFIG_HOME"); found && xdg != "" {
-		directory = strings.concatenate({xdg, "/httpie"}, allocator) or_else ""
-		return directory, directory != ""
+		xdg_directory, xdg_err := strings.concatenate({xdg, "/httpie"}, allocator)
+		if xdg_err != .None {
+			return "", false
+		}
+		return xdg_directory, true
 	}
-	directory = strings.concatenate({home, "/.config/httpie"}, allocator) or_else ""
-	return directory, directory != ""
+	config_path, config_err := strings.concatenate({home, "/.config/httpie"}, allocator)
+	if config_err != .None {
+		return "", false
+	}
+	return config_path, true
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +517,13 @@ session_load :: proc(session: ^Session, log: output.Console, options: ^cli.Optio
 	}
 	defer delete(data, allocator)
 
+	// The file exists (the read above succeeded), so this is where its mode is
+	// checked and tightened: session_save's SESSION_FILE_MODE only reaches a
+	// file the port writes, and a file httpie or an older build left 0644 keeps
+	// its group- and world-readable `raw_auth` until it is rewritten — which
+	// `--session-read-only` never does (backlog M4).
+	session_harden_file(session, log, options)
+
 	root, json_err := format.parse_json(string(data), allocator)
 	if json_err.message != "" {
 		message := fmt.aprintf(
@@ -488,13 +552,19 @@ session_load :: proc(session: ^Session, log: output.Console, options: ^cli.Optio
 	}
 
 	if value, found := format.object_get(&data_object, "headers"); found {
-		session_load_headers(session, value)
+		if !session_load_headers(session, value) {
+			return session_load_oom(log, options)
+		}
 	}
 	if value, found := format.object_get(&data_object, "cookies"); found {
-		session_load_cookies(session, value)
+		if !session_load_cookies(session, value) {
+			return session_load_oom(log, options)
+		}
 	}
 	if value, found := format.object_get(&data_object, "auth"); found {
-		session_load_auth(session, value)
+		if !session_load_auth(session, value) {
+			return session_load_oom(log, options)
+		}
 	}
 
 	// A pre-3.1/pre-3.2 file is read as-is, but httpie's upgrade plugins tell
@@ -593,9 +663,11 @@ write_warning :: proc(
 }
 
 // session_load_headers reads `headers`, in either the file's list shape or the
-// pre-3.2 object shape (legacy/v3_2_0_session_header_format.py).
+// pre-3.2 object shape (legacy/v3_2_0_session_header_format.py). False is a copy
+// that could not be made, reported by session_load: a header loaded with an
+// empty name or value would be a wrong request (backlog M5).
 @(private)
-session_load_headers :: proc(session: ^Session, value: ^format.Value) {
+session_load_headers :: proc(session: ^Session, value: ^format.Value) -> bool {
 	allocator := session.allocator
 	#partial switch data in value^ {
 	case format.Object:
@@ -610,7 +682,9 @@ session_load_headers :: proc(session: ^Session, value: ^format.Value) {
 				continue
 			}
 			text, _ := format.string_parts(member.value)
-			clone_header(&session.headers, member.key, text, allocator)
+			if !clone_header(&session.headers, member.key, text, allocator) {
+				return false
+			}
 		}
 	case []format.Value:
 		for item in data {
@@ -623,35 +697,47 @@ session_load_headers :: proc(session: ^Session, value: ^format.Value) {
 			if !has_name || !has_value {
 				continue
 			}
-			clone_header(&session.headers, name, header_value, allocator)
+			if !clone_header(&session.headers, name, header_value, allocator) {
+				return false
+			}
 		}
 	}
+	return true
 }
 
-// clone_header appends a header the session owns.
+// clone_header appends a header the session owns. False means the header was
+// not appended — the copy or the append failed — and the loader reports it
+// rather than keep a header with an empty name or value (backlog M5).
 @(private)
 clone_header :: proc(
 	headers: ^[dynamic]http.Header,
 	name: string,
 	value: string,
 	allocator: mem.Allocator,
-) {
-	header := http.Header {
-		name  = strings.clone(name, allocator) or_else "",
-		value = strings.clone(value, allocator) or_else "",
+) -> bool {
+	header: http.Header
+	if !http.clone_into(&header.name, name, allocator) {
+		return false
+	}
+	if !http.clone_into(&header.value, value, allocator) {
+		delete(header.name, allocator)
+		return false
 	}
 	if _, err := append(headers, header); err != nil {
 		delete(header.name, allocator)
 		delete(header.value, allocator)
+		return false
 	}
+	return true
 }
 
 // session_load_cookies reads `cookies`, in either the file's list shape or the
 // pre-3.1 object shape (legacy/v3_1_0_session_cookie_format.py). A missing or
 // null `domain` means a domainless cookie: the reference casts it to "" and
 // remembers it with `_rest['is_explicit_none']` (sessions.py:145-155).
+// False is a copy that could not be made, reported by session_load (backlog M5).
 @(private)
-session_load_cookies :: proc(session: ^Session, value: ^format.Value) {
+session_load_cookies :: proc(session: ^Session, value: ^format.Value) -> bool {
 	allocator := session.allocator
 	#partial switch data in value^ {
 	case format.Object:
@@ -662,8 +748,16 @@ session_load_cookies :: proc(session: ^Session, value: ^format.Value) {
 			if !is_object {
 				continue
 			}
-			cookie := cookie_from_json(&object, allocator)
-			cookie.name = strings.clone(member.key, allocator) or_else cookie.name
+			cookie, cookie_ok := cookie_from_json(&object, allocator)
+			if !cookie_ok {
+				return false
+			}
+			// The member key is this shape's cookie name; the copy answers the
+			// same way as the ones inside cookie_from_json (backlog M5).
+			if !http.clone_into(&cookie.name, member.key, allocator) {
+				cookie_destroy(&cookie, allocator)
+				return false
+			}
 			if cookie.domain == "" {
 				session.legacy_cookies_insecure = true
 			}
@@ -675,9 +769,14 @@ session_load_cookies :: proc(session: ^Session, value: ^format.Value) {
 			if !is_object {
 				continue
 			}
-			append_cookie(&session.cookies, cookie_from_json(&object, allocator), allocator)
+			cookie, cookie_ok := cookie_from_json(&object, allocator)
+			if !cookie_ok {
+				return false
+			}
+			append_cookie(&session.cookies, cookie, allocator)
 		}
 	}
+	return true
 }
 
 // append_cookie takes ownership of `cookie`, except on failure.
@@ -695,13 +794,27 @@ append_cookie :: proc(
 
 // cookie_from_json materialises one cookie the way `Session._add_cookies` does.
 @(private)
-cookie_from_json :: proc(object: ^format.Object, allocator: mem.Allocator) -> Cookie {
-	cookie: Cookie
-	cookie.name = json_string_or(object, "name", allocator)
-	cookie.value = json_string_or(object, "value", allocator)
-	cookie.path = json_string_or(object, "path", allocator)
+cookie_from_json :: proc(object: ^format.Object, allocator: mem.Allocator) -> (cookie: Cookie, ok: bool) {
+	cookie.name, ok = json_string_or(object, "name", allocator)
+	if !ok {
+		return {}, false
+	}
+	cookie.value, ok = json_string_or(object, "value", allocator)
+	if !ok {
+		cookie_destroy(&cookie, allocator)
+		return {}, false
+	}
+	cookie.path, ok = json_string_or(object, "path", allocator)
+	if !ok {
+		cookie_destroy(&cookie, allocator)
+		return {}, false
+	}
 	if cookie.path == "" {
-		cookie.path = strings.clone("/", allocator) or_else ""
+		cookie.path, ok = http.clone_or_oom("/", allocator)
+		if !ok {
+			cookie_destroy(&cookie, allocator)
+			return {}, false
+		}
 	}
 	cookie.secure, _ = json_bool(object, "secure")
 	switch domain_value, found := format.object_get(object, "domain"); {
@@ -715,7 +828,11 @@ cookie_from_json :: proc(object: ^format.Object, allocator: mem.Allocator) -> Co
 			break
 		}
 		text, _ := format.string_parts(domain_value^)
-		cookie.domain = strings.clone(text, allocator) or_else ""
+		cookie.domain, ok = http.clone_or_oom(text, allocator)
+		if !ok {
+			cookie_destroy(&cookie, allocator)
+			return {}, false
+		}
 	}
 	if expires_value, found := format.object_get(object, "expires"); found {
 		if seconds, is_number := json_number(expires_value^); is_number {
@@ -724,37 +841,51 @@ cookie_from_json :: proc(object: ^format.Object, allocator: mem.Allocator) -> Co
 		}
 	}
 	cookie.domain_specified = cookie.domain != ""
-	return cookie
+	// Every copy above answers `ok`; an empty cookie name or value would be a
+	// cookie the reference never stores (backlog M5).
+	return cookie, true
 }
 
 // session_load_auth reads the `auth` object. Both shapes are accepted: the new
 // `{"type", "raw_auth"}` and the legacy `{"type", "username", "password"}`
 // (sessions.py:272-304).
 @(private)
-session_load_auth :: proc(session: ^Session, value: ^format.Value) {
+session_load_auth :: proc(session: ^Session, value: ^format.Value) -> bool {
 	allocator := session.allocator
 	object, is_object := value^.(format.Object)
 	if !is_object {
-		return
+		return true
 	}
 	auth: Auth
 	if raw, found := json_string(&object, "raw_auth"); found {
 		auth.kind = .New
-		auth.raw_auth = strings.clone(raw, allocator) or_else ""
+		if !http.clone_into(&auth.raw_auth, raw, allocator) {
+			auth_destroy(&auth, allocator)
+			return false
+		}
 		auth.has_raw_auth = true
 	} else {
 		auth.kind = .Legacy
 		if username, has_username := json_string(&object, "username"); has_username {
-			auth.username = strings.clone(username, allocator) or_else ""
+			if !http.clone_into(&auth.username, username, allocator) {
+				auth_destroy(&auth, allocator)
+				return false
+			}
 			auth.has_username = true
 		}
 		if password, has_password := json_string(&object, "password"); has_password {
-			auth.password = strings.clone(password, allocator) or_else ""
+			if !http.clone_into(&auth.password, password, allocator) {
+				auth_destroy(&auth, allocator)
+				return false
+			}
 			auth.has_password = true
 		}
 	}
 	if auth_type, has_type := json_string(&object, "type"); has_type {
-		auth.type = strings.clone(auth_type, allocator) or_else ""
+		if !http.clone_into(&auth.type, auth_type, allocator) {
+			auth_destroy(&auth, allocator)
+			return false
+		}
 		auth.has_type = true
 	}
 	if !auth.has_type && !auth.has_raw_auth && !auth.has_username && !auth.has_password {
@@ -762,6 +893,7 @@ session_load_auth :: proc(session: ^Session, value: ^format.Value) {
 	}
 	auth_destroy(&session.auth, allocator)
 	session.auth = auth
+	return true
 }
 
 @(private)
@@ -794,13 +926,74 @@ session_finish :: proc(session: ^Session, response: ^http.Response) -> bool {
 	return session_save(session)
 }
 
+// session_harden_file re-asserts SESSION_FILE_MODE on a session file that was
+// already on disk when the run started. The mode the port gives
+// `os.write_entire_file_from_bytes` only applies to a *new* file, and
+// session_save's chmod only runs when the session is saved at all — so a file
+// httpie (which writes 0644 under umask 022) or an older build left behind is
+// read for the whole run with its plaintext `raw_auth` group- and
+// world-readable, and a `--session-read-only` run never repairs it. The file is
+// tightened here, once, and the run says so the way httpie reports its other
+// insecure-session case (INSECURE_COOKIE_JAR_WARNING).
+//
+// Best effort on purpose: a file the port may not chmod (someone else's, a
+// read-only mount) is reported and left alone — the run still works, and the
+// data is inside the 0700 session directory either way.
+@(private)
+session_harden_file :: proc(session: ^Session, log: output.Console, options: ^cli.Options) {
+	info, stat_err := os.stat(session.path, session.allocator)
+	if stat_err != nil {
+		return
+	}
+	defer os.file_info_delete(info, session.allocator)
+
+	shared := os.Permissions {
+		.Read_Group,
+		.Write_Group,
+		.Execute_Group,
+		.Read_Other,
+		.Write_Other,
+		.Execute_Other,
+	}
+	if (info.mode & shared) == {} {
+		return
+	}
+	message := fmt.aprintf(
+		"The session file %s is readable by other users and holds credentials in plaintext (%s).",
+		session.path,
+		session.read_only ? "left as it is under --session-read-only" : "its mode was tightened to 0600",
+		allocator = session.allocator,
+	)
+	defer delete(message, session.allocator)
+	output.write_log_warning(log, options.program_name, message)
+	// `--session-read-only` is a promise not to touch the file, so the mode is
+	// only tightened when the run may write it in the first place.
+	if !session.read_only {
+		_ = os.chmod(session.path, SESSION_FILE_MODE)
+	}
+}
+
+// session_load_oom reports a copy that could not be made while the session file
+// was being read: the run cannot go on with a half-read session, and the wording
+// is the one the parser already uses for an allocation failure (backlog M5).
+// Always false, so the loaders' call sites can `return session_load_oom(...)`.
+@(private)
+session_load_oom :: proc(log: output.Console, options: ^cli.Options) -> bool {
+	output.write_log_error(log, options.program_name, "not enough memory")
+	return false
+}
+
 // session_save writes the file the way `BaseConfigDict.save()` does, creating
 // the session directory (0700) first.
 @(private)
 session_save :: proc(session: ^Session) -> bool {
 	allocator := session.allocator
 
-	if parent := parent_directory(session.path, allocator); parent != "" {
+	parent, parent_ok := parent_directory(session.path, allocator)
+	if !parent_ok {
+		return false
+	}
+	if parent != "" {
 		defer delete(parent, allocator)
 		if err := os.make_directory_all(parent, SESSION_DIR_MODE); err != nil && err != .Exist {
 			return false
@@ -828,12 +1021,13 @@ session_save :: proc(session: ^Session) -> bool {
 
 // parent_directory is `path.parent` for a path with at least one separator.
 @(private)
-parent_directory :: proc(path: string, allocator: mem.Allocator) -> string {
+parent_directory :: proc(path: string, allocator: mem.Allocator) -> (parent: string, ok: bool) {
 	index := strings.last_index_byte(path, '/')
 	if index <= 0 {
-		return ""
+		// No separator: no parent, and nothing to allocate.
+		return "", true
 	}
-	return strings.clone(path[:index], allocator) or_else ""
+	return http.clone_or_oom(path[:index], allocator)
 }
 
 // session_json renders the session exactly as
@@ -1030,13 +1224,17 @@ json_string :: proc(object: ^format.Object, key: string) -> (string, bool) {
 	return text, true
 }
 
+// json_string_or is json_string with the copy taken for the caller. `ok` is
+// false only for that copy: a key that is absent or not a string is the empty
+// string with `ok` true, which is what the callers treat as "nothing there"
+// (backlog M5).
 @(private)
-json_string_or :: proc(object: ^format.Object, key: string, allocator: mem.Allocator) -> string {
-	text, found := json_string(object, key)
+json_string_or :: proc(object: ^format.Object, key: string, allocator: mem.Allocator) -> (text: string, ok: bool) {
+	value, found := json_string(object, key)
 	if !found {
-		return ""
+		return "", true
 	}
-	return strings.clone(text, allocator) or_else ""
+	return http.clone_or_oom(value, allocator)
 }
 
 @(private)
@@ -1081,9 +1279,12 @@ session_merge_headers :: proc(session: ^Session, request: ^http.Request) -> bool
 		// and requests collapses those to the last value while it prepares the
 		// request. Collapsing here keeps the wire bytes the same.
 		if index := header_index(request.headers[:], header.name); index >= 0 {
-			replacement := strings.clone(header.value, allocator) or_else ""
-			delete(request.headers[index].value, allocator)
-			request.headers[index].value = replacement
+			// The session's value replaces the request's in place; a copy that
+			// failed ends the build rather than keep the request's value, which
+			// would be the wrong header on the wire (backlog M5).
+			if !http.clone_into(&request.headers[index].value, header.value, allocator) {
+				return false
+			}
 			continue
 		}
 		if err := http.request_add_header(request, header.name, header.value); err != .None {
@@ -1113,9 +1314,13 @@ session_record_headers :: proc(
 	// carries an Accept of its own keeps that one. The header a body-less
 	// request gets is requests' session default, which is not stored.
 	if _, found := http.request_header_get(request, "Accept"); !found && request.json_accept {
-		header := http.Header {
-			name  = strings.clone("Accept", allocator) or_else "",
-			value = strings.clone(http.JSON_ACCEPT, allocator) or_else "",
+		header: http.Header
+		if !http.clone_into(&header.name, "Accept", allocator) ||
+		   !http.clone_into(&header.value, http.JSON_ACCEPT, allocator) {
+			delete(header.name, allocator)
+			delete(header.value, allocator)
+			free_headers(&new_headers, allocator)
+			return false
 		}
 		if _, err := append(&new_headers, header); err != nil {
 			delete(header.name, allocator)
@@ -1129,9 +1334,13 @@ session_record_headers :: proc(
 		if !session_stores_header(header.name, header.value, request.offline) {
 			continue
 		}
-		stored := http.Header {
-			name  = strings.clone(header.name, allocator) or_else "",
-			value = strings.clone(header.value, allocator) or_else "",
+		stored: http.Header
+		if !http.clone_into(&stored.name, header.name, allocator) ||
+		   !http.clone_into(&stored.value, header.value, allocator) {
+			delete(stored.name, allocator)
+			delete(stored.value, allocator)
+			free_headers(&new_headers, allocator)
+			return false
 		}
 		if _, err := append(&new_headers, stored); err != nil {
 			delete(stored.name, allocator)
@@ -1243,10 +1452,16 @@ session_record_auth :: proc(session: ^Session, options: ^cli.Options) -> bool {
 	allocator := session.allocator
 	auth := Auth {
 		kind         = .New,
-		type         = strings.clone(auth_type_name(options.auth_type), allocator) or_else "",
 		has_type     = true,
-		raw_auth     = strings.clone(options.auth, allocator) or_else "",
 		has_raw_auth = true,
+	}
+	// The credentials are the one thing this proc exists to store, so a copy
+	// that could not be made fails the save instead of writing an empty
+	// credential into the session file (backlog M5).
+	if !http.clone_into(&auth.type, auth_type_name(options.auth_type), allocator) ||
+	   !http.clone_into(&auth.raw_auth, options.auth, allocator) {
+		auth_destroy(&auth, allocator)
+		return false
 	}
 	auth_destroy(&session.auth, allocator)
 	session.auth = auth
@@ -1294,6 +1509,7 @@ session_auth_credentials :: proc(
 	credentials: string,
 	auth_type: http.Auth_Type,
 	ok: bool,
+	err: http.Error,
 ) {
 	switch {
 	case strings.equal_fold(session.auth.type, "bearer"):
@@ -1303,29 +1519,38 @@ session_auth_credentials :: proc(
 	case strings.equal_fold(session.auth.type, "basic"):
 		auth_type = .Basic
 	case:
-		return "", .Basic, false
+		return "", .Basic, false, .None
 	}
 
 	if session.auth.kind == .New || session.auth.has_raw_auth {
 		if !session.auth.has_raw_auth {
-			return "", auth_type, false
+			return "", auth_type, false, .None
 		}
-		credentials = strings.clone(session.auth.raw_auth, allocator) or_else ""
-		return credentials, auth_type, credentials != ""
+		// Never absorbed: an empty `raw_auth` here would be read as "no
+		// credentials" and the request would go out unauthenticated, where
+		// the failed copy is a failure the caller reports (backlog M5).
+		copy, copy_ok := http.clone_or_oom(session.auth.raw_auth, allocator)
+		if !copy_ok {
+			return "", auth_type, false, .Out_Of_Memory
+		}
+		return copy, auth_type, copy != "", .None
 	}
 
 	username := session.auth.username
 	password := session.auth.password
 	if !session.auth.has_username {
-		return "", auth_type, false
+		return "", auth_type, false, .None
 	}
 	if !session.auth.has_password {
 		// A username with no password is the `http://user@host/` shape: the
 		// empty password is what requests sends.
 		password = ""
 	}
-	credentials = strings.concatenate({username, ":", password}, allocator) or_else ""
-	return credentials, auth_type, true
+	joined, join_err := strings.concatenate({username, ":", password}, allocator)
+	if join_err != .None {
+		return "", auth_type, false, .Out_Of_Memory
+	}
+	return joined, auth_type, true, .None
 }
 
 // json_parse_int is Python's `int(text)` for the shapes a header value can

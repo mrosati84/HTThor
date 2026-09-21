@@ -4,11 +4,14 @@
 // Structure of one exchange:
 //
 //   * the request line, the headers and the body are handed to one easy handle;
-//   * libcurl follows redirects itself (so scheme, TLS and auth behaviour on
-//     each hop is the audited one), and the header callback re-assembles the
-//     hop-by-hop view from the status lines it sees;
-//   * the response body is buffered into the Response, or streamed into a
-//     caller-supplied writer for downloads;
+//   * the redirect chain is driven by the hop loop here, *not* by
+//     CURLOPT_FOLLOWLOCATION (a custom method has to survive it unchanged), and
+//     the header callback re-assembles the hop-by-hop view from the status
+//     lines it sees;
+//   * the response body is buffered into the Response, or streamed into the
+//     caller-supplied writer when there is one — the `send_to` path, which is
+//     what `--download` to a file uses. Buffering stops at MAX_BUFFERED_BODY
+//     rather than growing until the machine dies;
 //   * every C string that crosses the boundary lives in a C_String_List that
 //     outlives the transfer, and every allocation is released on both the
 //     success and the error path.
@@ -34,6 +37,14 @@ import "core:strings"
 // renderer prints the same User-Agent.
 USER_AGENT :: "HTTPie/3.2.4"
 ACCEPT_ENCODING :: "gzip, deflate"
+
+// MAX_BUFFERED_BODY is the most of a reply body the engine will hold in memory
+// when the caller gave it no writer. The reference has no such limit: requests
+// buffers the whole body and a reply bigger than the machine's memory takes the
+// process down with it. The port stops at half a gigabyte and reports
+// `Error.Body_Too_Large` instead, which is a deliberate divergence — `--download`
+// streams into its file and is not subject to the cap (backlog M3).
+MAX_BUFFERED_BODY :: 512 << 20
 
 // ENV_SCRATCH_SIZE is the stack buffer the environment lookups write into
 // (os.get_env_buf is limited to 512 UTF-16 values per name and value).
@@ -113,6 +124,9 @@ Transfer :: struct {
 	body:   Buffer,           // buffered reply (used when sink == nil)
 	sink:   Maybe(io.Writer), // when set, the body streams here instead
 	failed: Error,            // set by a callback: why the transfer was aborted
+	// written is how many body bytes went to `sink`; the Response reports it
+	// as `body_written`, because a streamed body leaves nothing to measure.
+	written: int,
 
 	// `sink` is honoured only for a hop that will not be followed: the body of
 	// a redirect is discarded, exactly as requests discards it (a `-d --follow`
@@ -483,7 +497,10 @@ Adapter_Error :: struct {
 // `repr()` of the URL, single quotes and all. The caller owns the result.
 adapter_error_message :: proc(err: ^Adapter_Error, allocator: mem.Allocator) -> string {
 	if !err.failed {
-		return strings.clone("", allocator) or_else ""
+		// The empty message is the "nothing to report" answer: an empty string
+		// is not an allocation, so there is nothing to copy and nothing that
+		// could fail here (backlog M5).
+		return ""
 	}
 	url_repr := python_str_repr(err.url, allocator)
 	defer delete(url_repr, allocator)
@@ -541,9 +558,17 @@ write_callback :: proc "c" (data: [^]u8, size: c.size_t, nmemb: c.size_t, userda
 			transfer.failed = .Write_Failed
 			return CURL_WRITEFUNC_ERROR
 		}
+		transfer.written += written
 		return c.size_t(length)
 	}
 
+	// No sink, or a hop whose body is not the caller's: the bytes accumulate in
+	// the buffer, and the buffer is capped (MAX_BUFFERED_BODY). The check is
+	// made before the append so the cap cannot be passed by one chunk.
+	if len(transfer.body.data) + length > MAX_BUFFERED_BODY {
+		transfer.failed = .Body_Too_Large
+		return CURL_WRITEFUNC_ERROR
+	}
 	if !buffer_append(&transfer.body, bytes) {
 		transfer.failed = .Out_Of_Memory
 		return CURL_WRITEFUNC_ERROR
@@ -749,7 +774,53 @@ apply_hop :: proc(
 		return map_curl_error(code)
 	}
 
-	has_body := len(hop.body) > 0
+	chunked, has_body, kind_err := apply_hop_select_request_kind(handle, hop, transfer, method_c)
+	if kind_err != .None {
+		return kind_err
+	}
+	digest_written, headers_err := apply_hop_build_request_headers(
+		req,
+		hop,
+		c_strings,
+		digest_authorization,
+		method_text,
+		chunked,
+		has_body,
+		slist,
+	)
+	if headers_err != .None {
+		return headers_err
+	}
+	digest_err := apply_hop_append_digest_authorization(req, c_strings, digest_authorization, digest_written, slist)
+	if digest_err != .None {
+		return digest_err
+	}
+	return apply_hop_install_header_list(handle, hop, c_strings, chunked, has_body, slist)
+}
+
+// apply_hop_select_request_kind is apply_hop's body-source decision, and with
+// it the *kind* of request libcurl performs: a `--chunked` hop is
+// CURLOPT_UPLOAD with no declared size, so libcurl frames it itself (the
+// reference hands requests a `ChunkedUploadStream(stream=iter([body]))`,
+// uploads.py:221-224), a hop with a known body is CURLOPT_POSTFIELDS, and a hop
+// with no body at all is reset to a bodyless GET — clearing POSTFIELDS alone
+// would leave a POST-shaped request announcing `Content-Length: 0`, which is
+// what a followed redirect that dropped its body must not send
+// (sessions.py:247-258). CURLOPT_CUSTOMREQUEST replaces only the method
+// *string*, so the kind is fixed first and the verb applied after it; and
+// because CURLOPT_HTTPGET resets the kind, a HEAD is marked CURLOPT_NOBODY
+// after that reset — only where the switch costs nothing, since it takes the
+// request body with it (CPython 3.11.15 Lib/http/client.py:381-385, :462-469;
+// build/probe_libcurl_head.c). Every other HEAD's reply is cut at the end of
+// its head instead (`Transfer.head_reply_only`, the header callback).
+@(private)
+apply_hop_select_request_kind :: proc(
+	handle: CURL,
+	hop: Hop,
+	transfer: ^Transfer,
+	method_c: cstring,
+) -> (chunked: bool, has_body: bool, err: Error) {
+	has_body = len(hop.body) > 0
 	// The framing decision is not the body's, it is the *upload's*: a
 	// `--chunked` request is chunked-framed on the wire whatever the items
 	// are. httpie hands requests a **stream** either way — with no data at
@@ -806,7 +877,7 @@ apply_hop :: proc(
 	// build/probe_libcurl_head.c's `upload-head-abort` measures: the same bytes
 	// as `upload-head` and no wait for a reply body. Both halves of the
 	// exchange then reach the server as the reference sends them.
-	chunked := hop.chunked && !hop.purge_body_headers
+	chunked = hop.chunked && !hop.purge_body_headers
 
 	// The option that selects the body source also selects the handle's request
 	// kind, so the kind is fixed first and CUSTOMREQUEST — which only replaces
@@ -819,36 +890,36 @@ apply_hop :: proc(
 	//     which is what a followed redirect that dropped its body must not send.
 	if chunked {
 		if code := setopt_long(handle, CURLOPT_UPLOAD, 1); code != CURLE_OK {
-			return map_curl_error(code)
+			return chunked, has_body, map_curl_error(code)
 		}
 		if code := setopt_read_callback(handle, CURLOPT_READFUNCTION, read_callback); code != CURLE_OK {
-			return map_curl_error(code)
+			return chunked, has_body, map_curl_error(code)
 		}
 		if code := setopt_ptr(handle, CURLOPT_READDATA, transfer); code != CURLE_OK {
-			return map_curl_error(code)
+			return chunked, has_body, map_curl_error(code)
 		}
 		// -1: "the size is not known" — libcurl chunks the upload.
 		if code := setopt_long(handle, CURLOPT_INFILESIZE, -1); code != CURLE_OK {
-			return map_curl_error(code)
+			return chunked, has_body, map_curl_error(code)
 		}
 	} else if has_body {
 		if code := setopt_ptr(handle, CURLOPT_POSTFIELDS, raw_data(hop.body)); code != CURLE_OK {
-			return map_curl_error(code)
+			return chunked, has_body, map_curl_error(code)
 		}
 		if code := setopt_long(handle, CURLOPT_POSTFIELDSIZE, c.long(len(hop.body))); code != CURLE_OK {
-			return map_curl_error(code)
+			return chunked, has_body, map_curl_error(code)
 		}
 	} else {
 		if code := setopt_long(handle, CURLOPT_HTTPGET, 1); code != CURLE_OK {
-			return map_curl_error(code)
+			return chunked, has_body, map_curl_error(code)
 		}
 		if code := setopt_long(handle, CURLOPT_POSTFIELDSIZE, 0); code != CURLE_OK {
-			return map_curl_error(code)
+			return chunked, has_body, map_curl_error(code)
 		}
 	}
 
 	if code := setopt_string(handle, CURLOPT_CUSTOMREQUEST, method_c); code != CURLE_OK {
-		return map_curl_error(code)
+		return chunked, has_body, map_curl_error(code)
 	}
 	// CURLOPT_HTTPGET above has reset the internal request kind to GET, and
 	// libcurl decides whether to wait for a response body from that kind — not
@@ -860,10 +931,35 @@ apply_hop :: proc(
 	// instead (see the framing note above).
 	head_without_request := hop.method == .HEAD && !chunked && !has_body
 	if code := setopt_long(handle, CURLOPT_NOBODY, head_without_request ? 1 : 0); code != CURLE_OK {
-		return map_curl_error(code)
+		return chunked, has_body, map_curl_error(code)
 	}
 	transfer.head_reply_only = hop.method == .HEAD && !head_without_request
+	return chunked, has_body, .None
+}
 
+// apply_hop_build_request_headers is the hop's header list: requests' prepared
+// header dict written line by line, with the three names `resolve_redirects`
+// pops when the chain followed a redirect that was not a 307/308 left out
+// (sessions.py:247-258) and the `Content-Length: 0` urllib3 frames a body-less
+// request with put first, where `_send_request` writes it (util/request.py:57,
+// :251-256; connection.py:543-560). An item that unset a name libcurl has a
+// default of its own for leaves libcurl's removal form instead
+// (connection.py:477-487), the `Cookie` a followed hop carries is re-derived
+// for that hop's URL (sessions.py:235-243), and the Digest answer such a hop is
+// re-sent with closes the list — the last entry, which is where requests'
+// assignment onto the prepared request puts it. `slist` is the list libcurl is
+// handed; the caller owns it and keeps it alive until the transfer is done.
+@(private)
+apply_hop_build_request_headers :: proc(
+	req: ^Request,
+	hop: Hop,
+	c_strings: ^C_String_List,
+	digest_authorization: string,
+	method_text: string,
+	chunked: bool,
+	has_body: bool,
+	slist: ^^CURL_slist,
+) -> (digest_authorization_written: bool, header_err: Error) {
 	slist^ = nil
 	// One line the head does not carry. A followed redirect that purged the
 	// body has popped the `Content-Length` requests' `prepare_content_length`
@@ -884,11 +980,11 @@ apply_hop :: proc(
 	if hop.purge_body_headers && !has_body && method_expects_a_body(method_text) {
 		framing, framing_ok := c_strings_add(c_strings, "Content-Length: 0")
 		if !framing_ok {
-			return .Out_Of_Memory
+			return digest_authorization_written, .Out_Of_Memory
 		}
 		slist^ = curl_slist_append(slist^, framing)
 		if slist^ == nil {
-			return .Out_Of_Memory
+			return digest_authorization_written, .Out_Of_Memory
 		}
 	}
 	// libcurl writes defaults of its own on a request that carries none of
@@ -915,22 +1011,22 @@ apply_hop :: proc(
 		}
 		removal, removal_err := strings.concatenate({name, ":"}, req.allocator)
 		if removal_err != .None {
-			return .Out_Of_Memory
+			return digest_authorization_written, .Out_Of_Memory
 		}
 		entry, entry_ok := c_strings_add(c_strings, removal)
 		delete(removal, req.allocator)
 		if !entry_ok {
-			return .Out_Of_Memory
+			return digest_authorization_written, .Out_Of_Memory
 		}
 		slist^ = curl_slist_append(slist^, entry)
 		if slist^ == nil {
-			return .Out_Of_Memory
+			return digest_authorization_written, .Out_Of_Memory
 		}
 	}
 	// Whether the Digest answer went out in the place of an `Authorization` the
 	// request already carried (see the loop below): a name written once is not
 	// written twice.
-	digest_authorization_written := false
+	digest_authorization_written = false
 	for header in req.headers {
 		// `Host` is libcurl's on the wire unless the caller supplied one (see
 		// the note further down). Everything else travels as a header entry so
@@ -966,16 +1062,16 @@ apply_hop :: proc(
 		if request_header_skipped(req, header.name, header.value) {
 			removal, removal_err := strings.concatenate({header.name, ":"}, req.allocator)
 			if removal_err != .None {
-				return .Out_Of_Memory
+				return digest_authorization_written, .Out_Of_Memory
 			}
 			entry, entry_ok := c_strings_add(c_strings, removal)
 			delete(removal, req.allocator)
 			if !entry_ok {
-				return .Out_Of_Memory
+				return digest_authorization_written, .Out_Of_Memory
 			}
 			slist^ = curl_slist_append(slist^, entry)
 			if slist^ == nil {
-				return .Out_Of_Memory
+				return digest_authorization_written, .Out_Of_Memory
 			}
 			continue
 		}
@@ -1033,7 +1129,7 @@ apply_hop :: proc(
 		// anything — so a refused run has already printed the rendered head on
 		// stdout (the render happens before the send) and sends no byte at all.
 		if err := request_encode_check(req, header.name, .Ascii); err != .None {
-			return err
+			return digest_authorization_written, err
 		}
 		// The exception is the value httpie still has as a `str` — the bearer
 		// token its plugin assigns after the headers were finalized. CPython
@@ -1055,12 +1151,12 @@ apply_hop :: proc(
 		text_value: string
 		if header.str_value {
 			if err := request_encode_check(req, value, .Latin1); err != .None {
-				return err
+				return digest_authorization_written, err
 			}
 			buffer := buffer_make(req.allocator, len(value))
 			if !str_latin1_encode_into(&buffer, value) {
 				buffer_destroy(&buffer)
-				return .Out_Of_Memory
+				return digest_authorization_written, .Out_Of_Memory
 			}
 			text_value = string(buffer_owned(&buffer))
 			value = text_value
@@ -1071,22 +1167,22 @@ apply_hop :: proc(
 		if text, part, found := wire_header_refusal(header.name, value); found {
 			refusal := wire_header_refuse(req, text, part)
 			delete(text_value, req.allocator)
-			return refusal
+			return digest_authorization_written, refusal
 		}
 		separator := value == "" ? ";" : ": "
 		line, concat_err := strings.concatenate({header.name, separator, value}, req.allocator)
 		delete(text_value, req.allocator)
 		if concat_err != .None {
-			return .Out_Of_Memory
+			return digest_authorization_written, .Out_Of_Memory
 		}
 		entry, entry_ok := c_strings_add(c_strings, line)
 		delete(line, req.allocator)
 		if !entry_ok {
-			return .Out_Of_Memory
+			return digest_authorization_written, .Out_Of_Memory
 		}
 		slist^ = curl_slist_append(slist^, entry)
 		if slist^ == nil {
-			return .Out_Of_Memory
+			return digest_authorization_written, .Out_Of_Memory
 		}
 	}
 	// The `Cookie` a followed hop carries, re-derived from the jar for its own
@@ -1104,19 +1200,38 @@ apply_hop :: proc(
 		if value != "" {
 			line, line_err := strings.concatenate({"Cookie: ", value}, req.allocator)
 			if line_err != .None {
-				return .Out_Of_Memory
+				return digest_authorization_written, .Out_Of_Memory
 			}
 			entry, entry_ok := c_strings_add(c_strings, line)
 			delete(line, req.allocator)
 			if !entry_ok {
-				return .Out_Of_Memory
+				return digest_authorization_written, .Out_Of_Memory
 			}
 			slist^ = curl_slist_append(slist^, entry)
 			if slist^ == nil {
-				return .Out_Of_Memory
+				return digest_authorization_written, .Out_Of_Memory
 			}
 		}
 	}
+	return digest_authorization_written, .None
+}
+
+// apply_hop_append_digest_authorization adds the Digest answer the hop is
+// *re-sent* with, as the last line of its head — which is where requests puts
+// it: `handle_401` assigns the header onto the copy of the prepared request
+// after everything that request already carried, and a dict assignment of a
+// name that is not already there leaves it at the end
+// (`CaseInsensitiveDict.__setitem__`). `written` is the header loop's answer to
+// "an `Authorization` item already took it": a name written once is not written
+// twice. Measured on a raw socket: build/probe_digest_head.py --wire.
+@(private)
+apply_hop_append_digest_authorization :: proc(
+	req: ^Request,
+	c_strings: ^C_String_List,
+	digest_authorization: string,
+	digest_authorization_written: bool,
+	slist: ^^CURL_slist,
+) -> Error {
 	// The Digest answer, last — which is where requests puts it: the header is
 	// assigned onto the copy of the prepared request (`handle_401`) after
 	// everything the request already carried, so the request's own headers come
@@ -1138,6 +1253,27 @@ apply_hop :: proc(
 			return .Out_Of_Memory
 		}
 	}
+	return .None
+}
+
+// apply_hop_install_header_list closes the list with the two entries that exist
+// only to keep libcurl from writing a line the reference never sends —
+// `Proxy-Connection` on a request that goes through a proxy, and
+// `Expect: 100-continue` on one that carries a body — and hands the finished
+// list to the handle (CURLOPT_HTTPHEADER). urllib3 writes the prepared head and
+// nothing of its own but the framing line above (connection.py:543-560), so
+// every default libcurl would add here is a difference on the wire; both are
+// removed with libcurl's own `Name:` form, the same trick the caller's unset
+// items use above.
+@(private)
+apply_hop_install_header_list :: proc(
+	handle: CURL,
+	hop: Hop,
+	c_strings: ^C_String_List,
+	chunked: bool,
+	has_body: bool,
+	slist: ^^CURL_slist,
+) -> Error {
 	if hop.via_proxy {
 		// libcurl adds `Proxy-Connection: Keep-Alive` to a request it sends
 		// through an HTTP proxy; requests does not send that header at all, and
@@ -1246,6 +1382,29 @@ should_strip_authorization :: proc(old_url: string, new_url: string) -> bool {
 	return changed_port || changed_scheme
 }
 
+// ssl_version_minimum maps a `--ssl` name onto the CURLOPT_SSLVERSION value
+// that enforces the same *floor*. The names are httpie's
+// `AVAILABLE_SSL_VERSION_ARG_MAPPING` keys (cli/usage.odin's
+// SSL_VERSION_CHOICES, the parser's choice list); the reference resolves each
+// to a Python `ssl.PROTOCOL_*` constant, and the port answers the same question
+// with libcurl's vocabulary. `ssl2.3` is Python's `PROTOCOL_SSLv23`, i.e.
+// "negotiate the best version either side has": no floor at all, libcurl's
+// default. An unrecognised name cannot reach here — the parser refuses it — and
+// is reported as unmapped so the caller leaves libcurl's default in place.
+ssl_version_minimum :: proc(name: string) -> (minimum: c.long, ok: bool) {
+	switch name {
+	case "ssl2.3":
+		return CURL_SSLVERSION_DEFAULT, true
+	case "tls1":
+		return CURL_SSLVERSION_TLSv1_0, true
+	case "tls1.1":
+		return CURL_SSLVERSION_TLSv1_1, true
+	case "tls1.2":
+		return CURL_SSLVERSION_TLSv1_2, true
+	}
+	return 0, false
+}
+
 // transport_send performs the exchange for `req` (already prepared) and fills
 // `res`, which must be zeroed. When `sink` is not nil the final reply body is
 // written there instead of being buffered. On failure `res` is left zeroed:
@@ -1288,29 +1447,18 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 	}
 	defer delete(url, req.allocator)
 
-	// `--path-as-is` is where the prepared URL and the wire URL part company:
-	// `request_url` carries the argv URL's path as it was written (`/a/./b c`),
-	// which is what the history renders, and the connection is handed that path
-	// *encoded* once — the reference's `_encode_target` (util/url.py:453-467) is
-	// the only thing that touches it at send time, so the raw space reaches the
-	// server as `%20` and a `%2e` keeps its escape with uppercase hex
-	// (`url_wire_url_into`, docs/PARITY.md §3.6). Every other first hop's
-	// prepared target is already in that encoded form, which is why the two
-	// URLs are otherwise the same string.
-	first_wire_url := url
-	first_wire_url_owned: string
+	// `--path-as-is` is the one first hop whose prepared target and wire
+	// target differ; `transport_send_first_wire_url` builds that wire URL, and
+	// the string it hands over outlives the loop that borrows it, so its
+	// `defer` cannot sit in the block that built it.
+	first_wire_url_owned, wire_url_err := transport_send_first_wire_url(req, url)
+	if wire_url_err != .None {
+		return wire_url_err
+	}
 	defer if first_wire_url_owned != "" {
 		delete(first_wire_url_owned, req.allocator)
 	}
-	if req.path_as_is {
-		wire_buffer := buffer_make(req.allocator, len(url) + 8)
-		if !url_wire_url_into(&wire_buffer, url) {
-			buffer_destroy(&wire_buffer)
-			return .Out_Of_Memory
-		}
-		first_wire_url_owned = string(buffer_owned(&wire_buffer))
-		first_wire_url = first_wire_url_owned
-	}
+	first_wire_url := first_wire_url_owned != "" ? first_wire_url_owned : url
 
 	transfer := transfer_make(req.allocator, res, sink, req.follow_redirects)
 	defer transfer_destroy(&transfer)
@@ -1321,17 +1469,179 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 	c_strings := c_strings_make(req.allocator)
 	defer c_strings_destroy(&c_strings)
 
+	// `transport_send_configure_handle` sets everything the handle carries
+	// for the chain. The proxy URL is function-scoped here: it must outlive
+	// the call that built it, and a `defer` inside that call would free it as
+	// the call returned.
+	prepared_proxy: string
+	defer delete(prepared_proxy, req.allocator)
+	use_proxy: bool
+	configure_err := transport_send_configure_handle(
+		handle,
+		req,
+		&transfer,
+		&c_strings,
+		&prepared_proxy,
+		&use_proxy,
+	)
+	if configure_err != .None {
+		return configure_err
+	}
+
+	// --- auth: basic and bearer travel as headers (request_prepare built
+	// them). Digest is answered *here*, not by libcurl: the handshake is two
+	// requests, and libcurl can only send the second one when it can rewind the
+	// first one's body — which a `--chunked` upload (INFILESIZE_UNKNOWN, a read
+	// callback with no seek) and a HEAD that carries bytes are not. The port
+	// therefore sends both requests as the reference does, with the answer it
+	// computes itself (src/http/digest.odin, docs/PARITY.md §4.1).
+	credentials := request_credentials(req)
+	digest_possible := req.auth_type == .Digest && (credentials != "" || req.userinfo_present)
+	// The `Authorization: Digest …` line the hop in flight is *re-sent* with: it
+	// belongs to one hop, so it is cleared before every hop of the chain (a
+	// redirect target gets its own challenge, and requests' copy does not carry
+	// the answer of the hop it was copied from).
+	digest_authorization: string
+	defer if digest_authorization != "" {
+		delete(digest_authorization, req.allocator)
+	}
+	digest_answered := false
+
+	// --- the hop loop (see the note above on why the chain is driven here)
+	hop := Hop {
+		method             = req.method,
+		method_raw         = request_method(req),
+		url                = url,            // borrowed: `url` outlives the loop
+		wire_url           = first_wire_url, // the first hop's prepared URL, encoded (see above)
+		body               = req.body_source != .None ? req.body : nil,
+		chunked            = req.chunked,
+		via_proxy          = use_proxy,
+		keep_authorization = true,
+	}
+	// The URL a followed redirect resolved to, owned here because `hop.url`
+	// borrows it (the first hop borrows the caller's `url` instead).
+	hop_url_owned: string
+	defer if hop_url_owned != "" {
+		delete(hop_url_owned, req.allocator)
+	}
+	// The same for the URL the connection is pointed at: `url_wire_url_into`
+	// builds it for every hop after the first (which borrows `url`).
+	hop_wire_owned: string
+	defer if hop_wire_owned != "" {
+		delete(hop_wire_owned, req.allocator)
+	}
+
+	redirects := 0
+	for {
+		// A Digest answer belongs to the hop it was computed for: the next hop
+		// of the chain starts its own handshake, with no header of its own.
+		if digest_authorization != "" {
+			delete(digest_authorization, req.allocator)
+			digest_authorization = ""
+		}
+		digest_answered = false
+		// The hop's exchange, and the one re-send the Digest handshake can add
+		// to it (`transport_send_perform_hop`).
+		hop_err := transport_send_perform_hop(
+			handle,
+			req,
+			&transfer,
+			&hop,
+			&c_strings,
+			digest_possible,
+			credentials,
+			&digest_authorization,
+			&digest_answered,
+		)
+		if hop_err != .None {
+			return hop_err
+		}
+
+		// The follow question, and the next hop when the answer is yes
+		// (`transport_send_follow_next_hop`): `.Stop` is the chain ending on this
+		// hop, `.Abort` the chain `follow_abort` has published on the request.
+		outcome, follow_err := transport_send_follow_next_hop(
+			req,
+			&transfer,
+			&hop,
+			&redirects,
+			&hop_url_owned,
+			&hop_wire_owned,
+		)
+		if outcome == .Abort {
+			return follow_err
+		}
+		if outcome == .Stop {
+			break
+		}
+	}
+
+	return transport_finish(req, res, &transfer, handle)
+}
+
+// transport_send_first_wire_url is the first hop's wire URL, and it is where the
+// prepared URL and the wire URL part company: `request_url` carries the argv
+// URL's path as it was written (`/a/./b c`), which is what the history renders,
+// and the connection is handed that path *encoded* once — the reference's
+// `_encode_target` (util/url.py:453-467) is the only thing that touches it at
+// send time, so the raw space reaches the server as `%20` and a `%2e` keeps its
+// escape with uppercase hex (`url_wire_url_into`, docs/PARITY.md §3.6). Every
+// other first hop's prepared target is already in that encoded form, which is
+// why the two URLs are otherwise the same string — and why "" is the answer
+// then, with the caller falling back to the prepared URL it already holds.
+@(private)
+transport_send_first_wire_url :: proc(req: ^Request, url: string) -> (string, Error) {
+	if !req.path_as_is {
+		return "", .None
+	}
+	wire_buffer := buffer_make(req.allocator, len(url) + 8)
+	if !url_wire_url_into(&wire_buffer, url) {
+		buffer_destroy(&wire_buffer)
+		return "", .Out_Of_Memory
+	}
+	return string(buffer_owned(&wire_buffer)), .None
+}
+
+// transport_send_configure_handle is the pre-transfer request preparation: every
+// option the handle carries for the whole chain, set before any hop is pointed
+// at it. The reply capture (the write and header callbacks, with the Transfer
+// as their userdata), the `Accept-Encoding` libcurl decodes replies with
+// (libcurl leaves a header of its own out once that name is in
+// CURLOPT_HTTPHEADER, connection.py:477-487), the transport policy (httpie's
+// `--timeout` as libcurl's whole-transfer and connect timeouts,
+// CURLOPT_NOSIGNAL, the HTTP version, and CURLOPT_PATH_AS_IS — the port's
+// version of "nothing else may normalize the target", because the reference's
+// transport only encodes at this point: `_encode_target`, util/url.py:453-467,
+// docs/PARITY.md §3.6), the TLS material (peer and host verification, the
+// `--verify=<bundle>` CA file, `--ciphers`, the `--ssl` floor and the client
+// certificate and key), and the explicit proxy — explicit so that libcurl's own
+// environment lookup stays out of the way (`proxy_for`, proxy.odin).
+//
+// `use_proxy` and `prepared_proxy` are written through pointers because they
+// outlive this proc: they are transport_send's own locals. `use_proxy` decides
+// the hop struct's `via_proxy`; `prepared_proxy` outlives the CURLOPT_PROXY it
+// was built for, and the `defer` that releases it is transport_send's, because
+// a `defer` here would free it as this proc returned.
+@(private)
+transport_send_configure_handle :: proc(
+	handle: CURL,
+	req: ^Request,
+	transfer: ^Transfer,
+	c_strings: ^C_String_List,
+	prepared_proxy: ^string,
+	use_proxy: ^bool,
+) -> Error {
 	// --- reply capture
 	if code := setopt_write_callback(handle, CURLOPT_WRITEFUNCTION, write_callback); code != CURLE_OK {
 		return map_curl_error(code)
 	}
-	if code := setopt_ptr(handle, CURLOPT_WRITEDATA, &transfer); code != CURLE_OK {
+	if code := setopt_ptr(handle, CURLOPT_WRITEDATA, transfer); code != CURLE_OK {
 		return map_curl_error(code)
 	}
 	if code := setopt_header_callback(handle, CURLOPT_HEADERFUNCTION, header_callback); code != CURLE_OK {
 		return map_curl_error(code)
 	}
-	if code := setopt_ptr(handle, CURLOPT_HEADERDATA, &transfer); code != CURLE_OK {
+	if code := setopt_ptr(handle, CURLOPT_HEADERDATA, transfer); code != CURLE_OK {
 		return map_curl_error(code)
 	}
 
@@ -1363,7 +1673,7 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 			encoding = announced
 		}
 	}
-	encoding_c, encoding_ok := c_strings_add(&c_strings, encoding)
+	encoding_c, encoding_ok := c_strings_add(c_strings, encoding)
 	if !encoding_ok {
 		return .Out_Of_Memory
 	}
@@ -1419,7 +1729,7 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 	// path is exactly what the reference trusts (nothing else changes: peer and
 	// host verification stay on).
 	if req.ca_bundle != "" {
-		ca_c, ca_ok := c_strings_add(&c_strings, req.ca_bundle)
+		ca_c, ca_ok := c_strings_add(c_strings, req.ca_bundle)
 		if !ca_ok {
 			return .Out_Of_Memory
 		}
@@ -1432,7 +1742,7 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 	// CURLE_SSL_CIPHER (mapped to .TLS_Failure above), which is the loud failure
 	// the help text promises.
 	if req.ciphers != "" {
-		ciphers_c, ciphers_ok := c_strings_add(&c_strings, req.ciphers)
+		ciphers_c, ciphers_ok := c_strings_add(c_strings, req.ciphers)
 		if !ciphers_ok {
 			return .Out_Of_Memory
 		}
@@ -1440,8 +1750,20 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 			return map_curl_error(code)
 		}
 	}
+	// `--ssl` is a floor, not a ceiling: the reference's choices name one
+	// protocol version, and libcurl is told the lowest one it may negotiate, so
+	// `--ssl=tls1.2` still talks to a server that only offers TLS 1.3. Without
+	// the option the floor is whatever the local libcurl/OpenSSL defaults to,
+	// which is what the flag exists to override.
+	if req.ssl_version != "" {
+		if minimum, ok := ssl_version_minimum(req.ssl_version); ok {
+			if code := setopt_long(handle, CURLOPT_SSLVERSION, minimum); code != CURLE_OK {
+				return map_curl_error(code)
+			}
+		}
+	}
 	if req.cert != "" {
-		cert_c, cert_ok := c_strings_add(&c_strings, req.cert)
+		cert_c, cert_ok := c_strings_add(c_strings, req.cert)
 		if !cert_ok {
 			return .Out_Of_Memory
 		}
@@ -1450,7 +1772,7 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 		}
 	}
 	if req.cert_key != "" {
-		key_c, key_ok := c_strings_add(&c_strings, req.cert_key)
+		key_c, key_ok := c_strings_add(c_strings, req.cert_key)
 		if !key_ok {
 			return .Out_Of_Memory
 		}
@@ -1461,7 +1783,7 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 		// prompting on the terminal ("Enter PEM pass phrase:"), which is what
 		// `--cert-key-pass` exists to prevent.
 		if req.cert_key_pass != "" {
-			pass_c, pass_ok := c_strings_add(&c_strings, req.cert_key_pass)
+			pass_c, pass_ok := c_strings_add(c_strings, req.cert_key_pass)
 			if !pass_ok {
 				return .Out_Of_Memory
 			}
@@ -1474,300 +1796,327 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 	// --- proxy (explicit, so libcurl's own environment lookup stays out of the
 	// way; see proxy.odin)
 	env_scratch: [ENV_SCRATCH_SIZE]u8
-	proxy, use_proxy := proxy_for(req, env_scratch[:])
-	// Function-scoped: the URL must outlive the block that built it, and a
-	// `defer` inside the `if` below would free it as that block ends.
-	prepared_proxy: string
-	defer delete(prepared_proxy, req.allocator)
+	proxy: string
+	proxy, use_proxy^ = proxy_for(req, env_scratch[:])
 	proxy_text := ""
-	if use_proxy {
+	if use_proxy^ {
 		prepared, prepared_ok := proxy_url(proxy, req.allocator)
 		if !prepared_ok {
 			return .Out_Of_Memory
 		}
-		prepared_proxy = prepared
-		proxy_text = prepared_proxy
+		prepared_proxy^ = prepared
+		proxy_text = prepared_proxy^
 	}
-	proxy_c, proxy_ok := c_strings_add(&c_strings, proxy_text)
+	proxy_c, proxy_ok := c_strings_add(c_strings, proxy_text)
 	if !proxy_ok {
 		return .Out_Of_Memory
 	}
 	if code := setopt_string(handle, CURLOPT_PROXY, proxy_c); code != CURLE_OK {
 		return map_curl_error(code)
 	}
+	return .None
+}
 
-	// --- auth: basic and bearer travel as headers (request_prepare built
-	// them). Digest is answered *here*, not by libcurl: the handshake is two
-	// requests, and libcurl can only send the second one when it can rewind the
-	// first one's body — which a `--chunked` upload (INFILESIZE_UNKNOWN, a read
-	// callback with no seek) and a HEAD that carries bytes are not. The port
-	// therefore sends both requests as the reference does, with the answer it
-	// computes itself (src/http/digest.odin, docs/PARITY.md §4.1).
-	credentials := request_credentials(req)
-	digest_possible := req.auth_type == .Digest && (credentials != "" || req.userinfo_present)
-	// The `Authorization: Digest …` line the hop in flight is *re-sent* with: it
-	// belongs to one hop, so it is cleared before every hop of the chain (a
-	// redirect target gets its own challenge, and requests' copy does not carry
-	// the answer of the hop it was copied from).
-	digest_authorization: string
-	defer if digest_authorization != "" {
-		delete(digest_authorization, req.allocator)
-	}
-	digest_answered := false
-
-	// --- the hop loop (see the note above on why the chain is driven here)
-	hop := Hop {
-		method             = req.method,
-		method_raw         = request_method(req),
-		url                = url,            // borrowed: `url` outlives the loop
-		wire_url           = first_wire_url, // the first hop's prepared URL, encoded (see above)
-		body               = req.body_source != .None ? req.body : nil,
-		chunked            = req.chunked,
-		via_proxy          = use_proxy,
-		keep_authorization = true,
-	}
-	// The URL a followed redirect resolved to, owned here because `hop.url`
-	// borrows it (the first hop borrows the caller's `url` instead).
-	hop_url_owned: string
-	defer if hop_url_owned != "" {
-		delete(hop_url_owned, req.allocator)
-	}
-	// The same for the URL the connection is pointed at: `url_wire_url_into`
-	// builds it for every hop after the first (which borrows `url`).
-	hop_wire_owned: string
-	defer if hop_wire_owned != "" {
-		delete(hop_wire_owned, req.allocator)
-	}
-
-	redirects := 0
+// transport_send_perform_hop performs one hop: the send, and the one re-send
+// the Digest handshake can add to it. requests' auth hook sends the request a
+// second time with the answer to the challenge on it (`handle_401`, and never a
+// third — `num_401_calls < 2`), which is what the reference's wire carries: the
+// same request bytes and framing, the answer appended after the caller's own
+// headers. libcurl's own retry is not it — it cannot rewind the bodies that
+// matter here (a `--chunked` upload is a stream, and a HEAD's reply is its head
+// — src/http/digest.odin, docs/PARITY.md §4.1). The hop's chunked body is handed
+// to libcurl only while it is still there to send: a hop whose chain already
+// sent it (`Hop.body_spent`) gets the framing and no bytes.
+//
+// `digest_authorization` is the answer in flight and `digest_answered` the
+// request in flight's, both transport_send's own state (the answer is cleared
+// for every hop of the chain above). The error it returns is `follow_abort`'s:
+// the chain has been published on the request by then.
+@(private)
+transport_send_perform_hop :: proc(
+	handle: CURL,
+	req: ^Request,
+	transfer: ^Transfer,
+	hop: ^Hop,
+	c_strings: ^C_String_List,
+	digest_possible: bool,
+	credentials: string,
+	digest_authorization: ^string,
+	digest_answered: ^bool,
+) -> Error {
 	for {
-		// A Digest answer belongs to the hop it was computed for: the next hop
-		// of the chain starts its own handshake, with no header of its own.
-		if digest_authorization != "" {
-			delete(digest_authorization, req.allocator)
-			digest_authorization = ""
-		}
-		digest_answered = false
-		// The hop's send, and the one re-send the Digest handshake can add to
-		// it: requests' auth hook sends the request a second time with the
-		// answer to the challenge on it (`handle_401`), and that is what the
-		// reference's wire carries — the same request bytes and framing, the
-		// answer appended after the caller's own headers.
-		for {
-			hop_slist: ^CURL_slist
-			// The hop's chunked body is handed to libcurl only while it is still
-			// there to send: a hop whose chain already sent it (Hop.body_spent)
-			// gets the framing and no bytes.
-			transfer.upload = hop.chunked && !hop.body_spent ? hop.body : nil
-			transfer.upload_pos = 0
-			if apply_err := apply_hop(handle, req, &transfer, &c_strings, hop, digest_authorization, &hop_slist); apply_err != .None {
-				slist_destroy(hop_slist)
-				return follow_abort(req, &transfer, apply_err, hop)
-			}
-			if !transfer_start_hop(&transfer, hop.method, hop.url) {
-				slist_destroy(hop_slist)
-				return follow_abort(req, &transfer, .Out_Of_Memory, hop)
-			}
-			// What the callbacks need to know about the handshake: whether this
-			// hop has one at all, and whether the request in flight already
-			// carries the answer (in which case the reply is the caller's,
-			// challenge or not — requests sends the request twice and never a
-			// third time, `num_401_calls < 2`).
-			transfer.digest_possible = digest_possible
-			transfer.digest_answered = digest_authorization != ""
-
-			code := curl_easy_perform(handle)
-			// The handle must not keep pointing at a list that is about to die.
-			setopt_ptr(handle, CURLOPT_HTTPHEADER, nil)
+		hop_slist: ^CURL_slist
+		// The hop's chunked body is handed to libcurl only while it is still
+		// there to send: a hop whose chain already sent it (Hop.body_spent)
+		// gets the framing and no bytes.
+		transfer.upload = hop.chunked && !hop.body_spent ? hop.body : nil
+		transfer.upload_pos = 0
+		if apply_err := apply_hop(handle, req, transfer, c_strings, hop^, digest_authorization^, &hop_slist); apply_err != .None {
 			slist_destroy(hop_slist)
+			return follow_abort(req, transfer, apply_err, hop^)
+		}
+		if !transfer_start_hop(transfer, hop.method, hop.url) {
+			slist_destroy(hop_slist)
+			return follow_abort(req, transfer, .Out_Of_Memory, hop^)
+		}
+		// What the callbacks need to know about the handshake: whether this
+		// hop has one at all, and whether the request in flight already
+		// carries the answer (in which case the reply is the caller's,
+		// challenge or not — requests sends the request twice and never a
+		// third time, `num_401_calls < 2`).
+		transfer.digest_possible = digest_possible
+		transfer.digest_answered = digest_authorization^ != ""
 
-			if transfer.failed != .None {
-				return follow_abort(req, &transfer, transfer.failed, hop)
-			}
-			// The one abort that is not a failure: a HEAD's reply ends where
-			// its head does, and the header callback cut the transfer there on
-			// purpose — CURLE_WRITE_ERROR is libcurl's word for a callback that
-			// said stop. `head_complete` is only set once the head is parsed
-			// and its status is not an interim `100`, so nothing is being
-			// swallowed here: the hop is answered exactly as the reference
-			// answered it (docs/PARITY.md §4.1).
-			if transfer.head_reply_only && transfer.head_complete && code == CURLE_WRITE_ERROR {
-				code = CURLE_OK
-			}
-			if code != CURLE_OK {
-				return follow_abort(req, &transfer, map_curl_error(code), hop)
-			}
+		code := curl_easy_perform(handle)
+		// The handle must not keep pointing at a list that is about to die.
+		setopt_ptr(handle, CURLOPT_HTTPHEADER, nil)
+		slist_destroy(hop_slist)
 
-			// The Digest answer, and with it the second request. requests'
-			// `handle_401` is an auth hook that runs once per prepared request
-			// (`num_401_calls < 2`) on the 4xx it gets back; the answer it
-			// computes goes on the wire after the request's own headers, and
-			// the request itself is re-sent — not modelled by libcurl's own
-			// retry, which cannot rewind the bodies this card is about
-			// (src/http/digest.odin).
-			if transfer.digest_possible && !transfer.digest_answered {
-				if answer, answered := digest_answer_for(hop, &transfer.hop, credentials, req.allocator); answered {
-					digest_authorization = answer
-					digest_answered = true
-					// The reference's `--chunked` body is a *stream* and the
-					// first send spent it, so the re-send announces the framing
-					// and hands over the terminating chunk alone — the same
-					// fact `Hop.body_spent` records for a followed 307/308, and
-					// what the reference's own retry puts on the wire
-					// (measured: build/probe_digest_head.py --wire).
-					if hop.chunked {
-						hop.body_spent = true
-					}
-					continue
+		if result_err, ok := transport_send_transfer_result(req, transfer, hop^, code); !ok {
+			return result_err
+		}
+
+		// The Digest answer, and with it the second request. requests'
+		// `handle_401` is an auth hook that runs once per prepared request
+		// (`num_401_calls < 2`) on the 4xx it gets back; the answer it
+		// computes goes on the wire after the request's own headers, and
+		// the request itself is re-sent — not modelled by libcurl's own
+		// retry, which cannot rewind the bodies this card is about
+		// (src/http/digest.odin).
+		if transfer.digest_possible && !transfer.digest_answered {
+			if answer, answered := digest_answer_for(hop^, &transfer.hop, credentials, req.allocator); answered {
+				digest_authorization^ = answer
+				digest_answered^ = true
+				// The reference's `--chunked` body is a *stream* and the
+				// first send spent it, so the re-send announces the framing
+				// and hands over the terminating chunk alone — the same
+				// fact `Hop.body_spent` records for a followed 307/308, and
+				// what the reference's own retry puts on the wire
+				// (measured: build/probe_digest_head.py --wire).
+				if hop.chunked {
+					hop.body_spent = true
 				}
+				continue
 			}
-			break
 		}
+		break
+	}
+	return .None
+}
 
-		// The follow question is requests' `is_redirect` — one of the five
-		// statuses *and* a `Location` (models.py:875-879) — which drives its
-		// `while url:` loop (sessions.py:134-143, :204). Both halves live in
-		// `is_redirect_hop`; the value is read here as well because it is the
-		// next hop's URL, but a 3xx outside the five, or one without the
-		// header, is the answer and the chain stops.
-		location, _ := hop_header_value(&transfer.hop, "location")
-		followable := req.follow_redirects && is_redirect_hop(&transfer.hop)
-		if !followable {
-			break
-		}
-		// requests reads the Location before it decides anything else about
-		// the hop: `get_redirect_target` decodes the header's bytes as UTF-8
-		// (sessions.py:142-151), and a Location the codec refuses raises there
-		// — before the redirect limit is consulted and before any hop is made.
-		// The port holds the header as the bytes it arrived in (§3.6), so the
-		// codec is a check rather than a conversion: a valid Location and the
-		// bytes are the same string.
-		location_error := str_utf8_decode_failure(location)
-		if location_error.failed {
-			req.location_error = location_error
-			return follow_abort(req, &transfer, .Redirect_Location_Not_Utf8, hop)
-		}
-		// `while url:` (sessions.py:204) — a Location that is empty is a
-		// falsy target, so the chain stops here and the 3xx stays the response.
-		if location == "" {
-			break
-		}
-		if req.max_redirects > 0 && redirects + 1 >= req.max_redirects {
-			// httpie counts responses, not followed redirects: it aborts as
-			// soon as the response number reaches --max-redirects
-			// (client.py:120-127, `if args.max_redirects and response_count ==
-			// args.max_redirects`), so `--max-redirects=1` refuses the first
-			// redirect outright. The abort happens after this hop's request
-			// went out, and that request is part of what the run printed
-			// (`follow_abort`).
-			return follow_abort(req, &transfer, .Too_Many_Redirects, hop)
-		}
-		redirects += 1
+// transport_send_transfer_result is the transfer's completion and the error
+// mapping that goes with it: the failure a callback recorded (a write that
+// failed, a body past MAX_BUFFERED_BODY) is the transfer's own, and the one
+// abort that is *not* a failure is a HEAD's reply ending where its head does —
+// the header callback cut the transfer there on purpose, and CURLE_WRITE_ERROR
+// is libcurl's word for a callback that said stop (CPython 3.11.15
+// Lib/http/client.py:467-469; docs/PARITY.md §4.1). `ok` false means
+// `follow_abort` has already published the chain on the request and `err` is
+// what the caller returns.
+@(private)
+transport_send_transfer_result :: proc(req: ^Request, transfer: ^Transfer, hop: Hop, code_in: CURLcode) -> (err: Error, ok: bool) {
+	if transfer.failed != .None {
+		return follow_abort(req, transfer, transfer.failed, hop), false
+	}
+	code := code_in
+	// The one abort that is not a failure: a HEAD's reply ends where
+	// its head does, and the header callback cut the transfer there on
+	// purpose — CURLE_WRITE_ERROR is libcurl's word for a callback that
+	// said stop. `head_complete` is only set once the head is parsed
+	// and its status is not an interim `100`, so nothing is being
+	// swallowed here: the hop is answered exactly as the reference
+	// answered it (docs/PARITY.md §4.1).
+	if transfer.head_reply_only && transfer.head_complete && code == CURLE_WRITE_ERROR {
+		code = CURLE_OK
+	}
+	if code != CURLE_OK {
+		return follow_abort(req, transfer, map_curl_error(code), hop), false
+	}
+	return .None, true
+}
 
-		// The response that led to this hop, read now: `transfer.hop` is reset
-		// a few lines below, when it becomes history. Both the method rewrite
-		// and the purge of the body's headers are decided from its status.
-		led_to_status := transfer.hop.status
-		next_method := redirect_method(hop.method, led_to_status)
+// Transport_Follow_Outcome is what the redirect phase decided about the chain:
+// `Stop` when requests' `while url:` ends on this hop (its reply is the
+// caller's), `Follow` when the hop was rewritten into the next one, and `Abort`
+// when the failure path published the chain on the request and `err` is what
+// the caller returns. The loop reads it instead of the `break`s and the
+// `return`s that used to sit at the end of its body.
+@(private)
+Transport_Follow_Outcome :: enum {
+	Stop,
+	Follow,
+	Abort,
+}
 
-		// The Location becomes the hop's URL in one step, `resolve_location`,
-		// which is requests' whole pipeline for it (sessions.py:224-243): the
-		// scheme-relative step, `urlparse`/`geturl`, `requote_uri` and then
-		// `urljoin` or the requote alone. The order matters and the rule lives
-		// with its own comments in src/http/url.odin
-		// (`url_location_resolve_into`); what comes out is the *prepared* URL,
-		// the one requests holds in `prepared_request.url` and the one httpie
-		// renders (`urlsplit` of it, models.py:141-147).
-		next_url, next_err := resolve_location(hop.url, location, req.allocator)
-		if next_err != .None {
-			return follow_abort(req, &transfer, next_err, hop)
-		}
-		// requests holds that target in `prepared_request.url` and looks for an
-		// adapter to send it with; `Session.get_adapter` matches the URL
-		// against the mounted prefixes — httpie mounts `http://` and
-		// `https://` only — and a URL that starts with neither raises
-		// `InvalidSchema: No connection adapters were found for '…'` before
-		// anything connects (sessions.py:870-881). The port refuses that target
-		// at the same site, with the reference's own message (Adapter_Error,
-		// rendered by adapter_error_message), which also keeps libcurl from
-		// opening a protocol conversation the server will never answer — an
-		// `ftp://` target used to sit in one until the request timed out
-		// (docs/PARITY.md §3.6).
-		//
-		// The refused request is part of the chain the caller has to print:
-		// requests' own loop built it and httpie yielded it before the send
-		// that refused it (`yield prepared_request`, client.py:105), so it is
-		// the *last* entry of the history rather than the hop in flight
-		// (`follow_abort_refused`).
-		if !url_has_http_adapter(next_url) {
-			return follow_abort_refused(req, &transfer, hop, next_url, next_method)
-		}
+// transport_send_follow_next_hop is the hop/redirect bookkeeping requests does
+// inside `resolve_redirects`: the follow question itself (`resp.is_redirect` —
+// one of the five statuses *and* a `Location` — models.py:875-879, driving
+// `while url:` — sessions.py:134-143, :204), the Location's codec
+// (`get_redirect_target`, sessions.py:142-151), the `--max-redirects` count
+// httpie takes over responses rather than redirects (client.py:120-127), the
+// method rewrite (`redirect_method`, sessions.py:370-392, called from :265),
+// the purge of the body and of the three headers that describe it
+// (`redirect_keeps_body`, sessions.py:249-258), the resolved target's adapter
+// (`Session.get_adapter`, sessions.py:870-881), the URL requests prepared out
+// of the Location (`resolve_location`, sessions.py:224-243) and the fate of the
+// credentials (`should_strip_authorization`, sessions.py:128-158). The hop in
+// flight becomes history and `hop` is rewritten into the next one.
+//
+// `redirects`, `hop_url_owned` and `hop_wire_owned` are transport_send's own
+// state, written through pointers because it belongs to that scope — the two
+// `defer`s that release those URLs stay there. `hop` borrows them, and, for the
+// first hop, the caller's own `url`.
+@(private)
+transport_send_follow_next_hop :: proc(
+	req: ^Request,
+	transfer: ^Transfer,
+	hop: ^Hop,
+	redirects: ^int,
+	hop_url_owned: ^string,
+	hop_wire_owned: ^string,
+) -> (outcome: Transport_Follow_Outcome, err: Error) {
+	// The follow question is requests' `is_redirect` — one of the five
+	// statuses *and* a `Location` (models.py:875-879) — which drives its
+	// `while url:` loop (sessions.py:134-143, :204). Both halves live in
+	// `is_redirect_hop`; the value is read here as well because it is the
+	// next hop's URL, but a 3xx outside the five, or one without the
+	// header, is the answer and the chain stops.
+	location, _ := hop_header_value(&transfer.hop, "location")
+	followable := req.follow_redirects && is_redirect_hop(&transfer.hop)
+	if !followable {
+		return .Stop, .None
+	}
+	// requests reads the Location before it decides anything else about
+	// the hop: `get_redirect_target` decodes the header's bytes as UTF-8
+	// (sessions.py:142-151), and a Location the codec refuses raises there
+	// — before the redirect limit is consulted and before any hop is made.
+	// The port holds the header as the bytes it arrived in (§3.6), so the
+	// codec is a check rather than a conversion: a valid Location and the
+	// bytes are the same string.
+	location_error := str_utf8_decode_failure(location)
+	if location_error.failed {
+		req.location_error = location_error
+		return .Abort, follow_abort(req, transfer, .Redirect_Location_Not_Utf8, hop^)
+	}
+	// `while url:` (sessions.py:204) — a Location that is empty is a
+	// falsy target, so the chain stops here and the 3xx stays the response.
+	if location == "" {
+		return .Stop, .None
+	}
+	if req.max_redirects > 0 && redirects^ + 1 >= req.max_redirects {
+		// httpie counts responses, not followed redirects: it aborts as
+		// soon as the response number reaches --max-redirects
+		// (client.py:120-127, `if args.max_redirects and response_count ==
+		// args.max_redirects`), so `--max-redirects=1` refuses the first
+		// redirect outright. The abort happens after this hop's request
+		// went out, and that request is part of what the run printed
+		// (`follow_abort`).
+		return .Abort, follow_abort(req, transfer, .Too_Many_Redirects, hop^)
+	}
+	redirects^ += 1
 
-		// What the hop is *sent* with is that same URL with its path and query
-		// encoded the way urllib3 encodes them at send time; the URL above is
-		// the one the history renders (docs/PARITY.md §3.6).
-		wire_buffer := buffer_make(req.allocator, len(next_url) + 8)
-		if !url_wire_url_into(&wire_buffer, next_url) {
-			buffer_destroy(&wire_buffer)
-			delete(next_url, req.allocator)
-			return follow_abort(req, &transfer, .Out_Of_Memory, hop)
-		}
-		next_wire_url := string(buffer_owned(&wire_buffer))
+	// The response that led to this hop, read now: `transfer.hop` is reset
+	// a few lines below, when it becomes history. Both the method rewrite
+	// and the purge of the body's headers are decided from its status.
+	led_to_status := transfer.hop.status
+	next_method := redirect_method(hop.method, led_to_status)
 
-		// The hop just performed becomes history; what `res` will describe is
-		// whatever the chain ends on.
-		if !slice_push(&transfer.history, transfer.hop, req.allocator) {
-			delete(next_wire_url, req.allocator)
-			delete(next_url, req.allocator)
-			return follow_abort(req, &transfer, .Out_Of_Memory, hop)
-		}
-		transfer.hop = {}
-
-		if hop_url_owned != "" {
-			delete(hop_url_owned, req.allocator)
-		}
-		hop_url_owned = next_url
-		if hop_wire_owned != "" {
-			delete(hop_wire_owned, req.allocator)
-		}
-		hop_wire_owned = next_wire_url
-
-		// Only the method survives, not the body: a rewritten hop is a fresh
-		// request (requests drops the body with the method). The verb string
-		// has to follow the rewrite too — apply_hop reads `method_raw` before
-		// the enum, so leaving the original spelling there would put POST on
-		// the wire with no body.
-		if next_method != hop.method {
-			hop.method_raw = method_to_string(next_method)
-		}
-		if !redirect_keeps_body(led_to_status) {
-			// requests' purge, body and headers together: anything but a
-			// 307/308 loses the body *and* `Content-Length`/`Content-Type`/
-			// `Transfer-Encoding`, even when the method was not rewritten at
-			// all (a 303 keeps a `GET` a `GET` and still clears its body).
-			// `hop.body` stays nil for every hop after this one: the reference
-			// copies the purged prepared request forward.
-			hop.purge_body_headers = true
-			hop.body = nil
-		} else if hop.chunked && len(hop.body) > 0 {
-			// A 307/308 keeps the body, but the reference's `--chunked` body
-			// is a stream, and the hop just sent it: the iterator the hop's
-			// prepared request still points at is exhausted, so the *next*
-			// hop announces the framing and sends nothing (Hop.body_spent,
-			// and src/session/context.odin's `write_hop_request`, which stops
-			// printing the body of such a hop for the same reason). A body
-			// the purge above took away is not this case: it is gone for
-			// good, and `hop.body` stays nil, so nothing is set here.
-			hop.body_spent = true
-		}
-		hop.keep_authorization = !should_strip_authorization(hop.url, next_url)
-		hop.redirect_target = true
-		hop.method = next_method
-		hop.url = next_url
-		hop.wire_url = next_wire_url
+	// The Location becomes the hop's URL in one step, `resolve_location`,
+	// which is requests' whole pipeline for it (sessions.py:224-243): the
+	// scheme-relative step, `urlparse`/`geturl`, `requote_uri` and then
+	// `urljoin` or the requote alone. The order matters and the rule lives
+	// with its own comments in src/http/url.odin
+	// (`url_location_resolve_into`); what comes out is the *prepared* URL,
+	// the one requests holds in `prepared_request.url` and the one httpie
+	// renders (`urlsplit` of it, models.py:141-147).
+	next_url, next_err := resolve_location(hop.url, location, req.allocator)
+	if next_err != .None {
+		return .Abort, follow_abort(req, transfer, next_err, hop^)
+	}
+	// requests holds that target in `prepared_request.url` and looks for an
+	// adapter to send it with; `Session.get_adapter` matches the URL
+	// against the mounted prefixes — httpie mounts `http://` and
+	// `https://` only — and a URL that starts with neither raises
+	// `InvalidSchema: No connection adapters were found for '…'` before
+	// anything connects (sessions.py:870-881). The port refuses that target
+	// at the same site, with the reference's own message (Adapter_Error,
+	// rendered by adapter_error_message), which also keeps libcurl from
+	// opening a protocol conversation the server will never answer — an
+	// `ftp://` target used to sit in one until the request timed out
+	// (docs/PARITY.md §3.6).
+	//
+	// The refused request is part of the chain the caller has to print:
+	// requests' own loop built it and httpie yielded it before the send
+	// that refused it (`yield prepared_request`, client.py:105), so it is
+	// the *last* entry of the history rather than the hop in flight
+	// (`follow_abort_refused`).
+	if !url_has_http_adapter(next_url) {
+		return .Abort, follow_abort_refused(req, transfer, hop^, next_url, next_method)
 	}
 
-	return transport_finish(req, res, &transfer, handle)
+	// What the hop is *sent* with is that same URL with its path and query
+	// encoded the way urllib3 encodes them at send time; the URL above is
+	// the one the history renders (docs/PARITY.md §3.6).
+	wire_buffer := buffer_make(req.allocator, len(next_url) + 8)
+	if !url_wire_url_into(&wire_buffer, next_url) {
+		buffer_destroy(&wire_buffer)
+		delete(next_url, req.allocator)
+		return .Abort, follow_abort(req, transfer, .Out_Of_Memory, hop^)
+	}
+	next_wire_url := string(buffer_owned(&wire_buffer))
+
+	// The hop just performed becomes history; what `res` will describe is
+	// whatever the chain ends on.
+	if !slice_push(&transfer.history, transfer.hop, req.allocator) {
+		delete(next_wire_url, req.allocator)
+		delete(next_url, req.allocator)
+		return .Abort, follow_abort(req, transfer, .Out_Of_Memory, hop^)
+	}
+	transfer.hop = {}
+
+	if hop_url_owned^ != "" {
+		delete(hop_url_owned^, req.allocator)
+	}
+	hop_url_owned^ = next_url
+	if hop_wire_owned^ != "" {
+		delete(hop_wire_owned^, req.allocator)
+	}
+	hop_wire_owned^ = next_wire_url
+
+	// Only the method survives, not the body: a rewritten hop is a fresh
+	// request (requests drops the body with the method). The verb string
+	// has to follow the rewrite too — apply_hop reads `method_raw` before
+	// the enum, so leaving the original spelling there would put POST on
+	// the wire with no body.
+	if next_method != hop.method {
+		hop.method_raw = method_to_string(next_method)
+	}
+	if !redirect_keeps_body(led_to_status) {
+		// requests' purge, body and headers together: anything but a
+		// 307/308 loses the body *and* `Content-Length`/`Content-Type`/
+		// `Transfer-Encoding`, even when the method was not rewritten at
+		// all (a 303 keeps a `GET` a `GET` and still clears its body).
+		// `hop.body` stays nil for every hop after this one: the reference
+		// copies the purged prepared request forward.
+		hop.purge_body_headers = true
+		hop.body = nil
+	} else if hop.chunked && len(hop.body) > 0 {
+		// A 307/308 keeps the body, but the reference's `--chunked` body
+		// is a stream, and the hop just sent it: the iterator the hop's
+		// prepared request still points at is exhausted, so the *next*
+		// hop announces the framing and sends nothing (Hop.body_spent,
+		// and src/session/context.odin's `write_hop_request`, which stops
+		// printing the body of such a hop for the same reason). A body
+		// the purge above took away is not this case: it is gone for
+		// good, and `hop.body` stays nil, so nothing is set here.
+		hop.body_spent = true
+	}
+	hop.keep_authorization = !should_strip_authorization(hop.url, next_url)
+	hop.redirect_target = true
+	hop.method = next_method
+	hop.url = next_url
+	hop.wire_url = next_wire_url
+	return .Follow, .None
 }
 
 // follow_abort is the failure path of a followed chain: it hands the renderer
@@ -1783,12 +2132,20 @@ transport_send :: proc(req: ^Request, res: ^Response, sink: Maybe(io.Writer)) ->
 @(private)
 follow_abort :: proc(req: ^Request, transfer: ^Transfer, err: Error, pending: Hop) -> Error {
 	if pending.url != "" {
-		entry := Exchange {
-			method = pending.method,
-			url    = strings.clone(pending.url, req.allocator) or_else "",
-		}
-		if entry.url == "" || !slice_push(&transfer.history, entry, req.allocator) {
-			exchange_destroy(&entry, req.allocator)
+		// The hop in flight joins the history as a request-only entry. Its
+		// URL copy is the one part of that entry that can fail, and the error
+		// the caller is owed is `err`: a copy that cannot be made costs the
+		// entry, not the error — the same drop the `slice_push` failure below
+		// takes.
+		url_copy, ok := clone_or_oom(pending.url, req.allocator)
+		if ok {
+			entry := Exchange {
+				method = pending.method,
+				url    = url_copy,
+			}
+			if !slice_push(&transfer.history, entry, req.allocator) {
+				exchange_destroy(&entry, req.allocator)
+			}
 		}
 	}
 	// Published on the request, not the reply: `send` leaves `res` zeroed on
@@ -1809,8 +2166,8 @@ follow_abort :: proc(req: ^Request, transfer: ^Transfer, err: Error, pending: Ho
 // releases it (types.odin, `Adapter_Error`).
 @(private)
 adapterless_failure :: proc(req: ^Request) -> Error {
-	url_copy := strings.clone(req.url_text, req.allocator) or_else ""
-	if url_copy == "" {
+	url_copy, ok := clone_or_oom(req.url_text, req.allocator)
+	if !ok {
 		return .Out_Of_Memory
 	}
 	req.adapter_error = {failed = true, url = url_copy}
@@ -1842,12 +2199,14 @@ follow_abort_refused :: proc(
 	// follow_abort; the refused request follows it, in the order httpie printed
 	// them. A clone that cannot be made costs the request line, not the error.
 	err := follow_abort(req, transfer, .No_Connection_Adapter, pending)
-	entry := Exchange {
-		method = refused_method,
-		url    = strings.clone(refused_url, req.allocator) or_else "",
-	}
-	if entry.url == "" || !slice_push(&req.follow_history, entry, req.allocator) {
-		exchange_destroy(&entry, req.allocator)
+	if url_copy, ok := clone_or_oom(refused_url, req.allocator); ok {
+		entry := Exchange {
+			method = refused_method,
+			url    = url_copy,
+		}
+		if !slice_push(&req.follow_history, entry, req.allocator) {
+			exchange_destroy(&entry, req.allocator)
+		}
 	}
 	return err
 }
@@ -1874,9 +2233,14 @@ transport_finish :: proc(req: ^Request, res: ^Response, transfer: ^Transfer, han
 	// request as it sends it, client.py:104-127). Its headers are about to move
 	// into the Response, so this entry carries only what the request line needs
 	// and owns its own copy of the URL.
+	final_url, ok := clone_or_oom(transfer.hop.url, req.allocator)
+	if !ok {
+		response_destroy(res)
+		return .Out_Of_Memory
+	}
 	final_hop := Exchange {
 		method = transfer.hop.method,
-		url    = strings.clone(transfer.hop.url, req.allocator) or_else "",
+		url    = final_url,
 		status = transfer.hop.status,
 	}
 	if !slice_push(&transfer.history, final_hop, req.allocator) {
@@ -1910,7 +2274,9 @@ transport_finish :: proc(req: ^Request, res: ^Response, transfer: ^Transfer, han
 	res.history = transfer.history
 	transfer.history = nil
 
-	// A streamed body went to the caller's writer; the Response keeps no copy.
+	// A streamed body went to the caller's writer; the Response keeps no copy,
+	// only the count of what went there.
+	res.body_written = transfer.written
 	if transfer.sink == nil {
 		res.body = buffer_owned(&transfer.body)
 	}

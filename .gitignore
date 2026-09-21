@@ -9,10 +9,6 @@ local.mk
 # Scratch directory the test helpers fall back to when $TMPDIR is unset.
 /tmp/
 
-# Reference-capture sandbox (httpie config/XDG/HOME/downloads) left behind by
-# the removed parity harness: scratch, not part of the tree. The session
-# fixtures the unit suite reads live in tests/fixtures/sessions/.
 /.capture-sandbox/
 
 /.opencode/
-

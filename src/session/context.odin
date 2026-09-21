@@ -212,7 +212,19 @@ run :: proc(ctx: ^Context) -> int {
 
 	started := time.now()
 	response: http.Response
-	send_err := http.send(&request, &response)
+	// `--download` to a file streams the body straight into it (`send_to`), so
+	// the reply never has to fit in memory and the cap on the buffering path
+	// (http.MAX_BUFFERED_BODY) does not apply to it. `--continue` is the
+	// exception: whether its file is truncated or appended to depends on the
+	// reply head (`resumed`, in download_response), which the reference settles
+	// before the body is written but the port only sees once the transfer is
+	// over — so that path keeps the (now capped) buffer.
+	send_err: http.Error
+	if download_target != nil && !options.download_resume {
+		send_err = http.send_to(&request, &response, os.to_writer(download_target))
+	} else {
+		send_err = http.send(&request, &response)
+	}
 	elapsed_s := time.duration_seconds(time.since(started))
 	if send_err != .None {
 		// A chain that died mid-follow has already printed the request of every
@@ -596,7 +608,94 @@ parts_any :: proc(parts: output.Parts) -> bool {
 // the request's base headers and the request headers are what the session
 // records back (client.py:48-81). On failure it prints httpie's runtime error
 // and returns false.
+//
+// Its steps are `make_request_kwargs`' (client.py:325-375) and the block around
+// it, carried out in the reference's order: the URL, the session's headers and
+// the item headers, the query items, the body, the transport policy, the auth,
+// what the session records back, and finally the headers httpie adds and orders
+// once the request is prepared. Each step is one @(private) helper immediately
+// below, reachable from here and nowhere else; a helper answers false once it
+// has written the run's error, so the `return false` here is always the same
+// act.
 build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) -> bool {
+	options := &ctx.options
+	allocator := ctx.allocator
+
+	if !build_request_url(ctx, request) {
+		return false
+	}
+	if !build_request_session_headers(ctx, session, request) {
+		return false
+	}
+	if !build_request_query_items(ctx, request) {
+		return false
+	}
+
+	// The item headers are also what the header order is read from further
+	// down (request_own_names), so the fold lives here and that phase takes a
+	// pointer to it.
+	fold := cli.header_fold(&options.item_set, allocator)
+	defer cli.header_fold_destroy(&fold)
+	if !build_request_item_headers(ctx, request, &fold) {
+		return false
+	}
+	if !build_request_finalize_headers(ctx, request) {
+		return false
+	}
+	if !build_request_prepared_url_checks(ctx, request) {
+		return false
+	}
+	if !build_request_multipart_content_type_item(ctx, request) {
+		return false
+	}
+	if !build_request_body(ctx, request) {
+		return false
+	}
+
+	if options.boundary != "" {
+		// The boundary is empty when the option is not given, so a copy that
+		// failed would look like "no boundary" in the body (backlog M5).
+		if !http.clone_into(&request.boundary, options.boundary, allocator) {
+			return request_failure(ctx, .Out_Of_Memory)
+		}
+	}
+
+	if !build_request_transport_options(ctx, request) {
+		return false
+	}
+	if !build_request_json_accept(ctx, request) {
+		return false
+	}
+	if !build_request_proxy_and_tls(ctx, request) {
+		return false
+	}
+	if !build_request_auth(ctx, request, session) {
+		return false
+	}
+	if !build_request_record_session(ctx, request, session) {
+		return false
+	}
+
+	if err := http.request_prepare(request); err != .None {
+		return request_error(ctx, request, err)
+	}
+
+	if !build_request_default_headers(ctx, request) {
+		return false
+	}
+	build_request_cookies(session, request)
+	if !build_request_order_headers(ctx, session, request, &fold) {
+		return false
+	}
+	return true
+}
+
+// build_request_url is the URL the invocation names — `requests.Request(...)`,
+// whose `prepare_url` runs before anything else about the request is prepared
+// (client.py:48-81, models.py:430-505). False means the message is already on
+// the run's stderr.
+@(private)
+build_request_url :: proc(ctx: ^Context, request: ^http.Request) -> bool {
 	options := &ctx.options
 	allocator := ctx.allocator
 
@@ -627,23 +726,40 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 		return false
 	}
 	request^ = req
+	return true
+}
 
-	// The session's own headers come first (client.py:48-63): they override
-	// httpie's defaults and are overridden by the item headers below. They are
-	// the first entries of the request dict there too, and an item that repeats
-	// a name replaces its value in that slot.
+// build_request_session_headers merges the session's own headers into the
+// request, first.
+// The session's own headers come first (client.py:48-63): they override
+// httpie's defaults and are overridden by the item headers below. They are
+// the first entries of the request dict there too, and an item that repeats
+// a name replaces its value in that slot.
+@(private)
+build_request_session_headers :: proc(
+	ctx: ^Context,
+	session: ^Session,
+	request: ^http.Request,
+) -> bool {
 	if session != nil {
 		if !session_merge_headers(session, request) {
 			return request_failure(ctx, .Out_Of_Memory)
 		}
 	}
+	return true
+}
 
-	// Query items (`name==value`) and headers (`name:value`) come straight from
-	// the item grammar. The query items are the exception for a URL requests
-	// never prepared: `prepare_url` encodes them into the URL it is about to
-	// prepare (`_encode_params`, models.py:550) and returns *before* that for
-	// the short-circuited URL, so they are simply not there — the rendered
-	// target keeps the URL's own query and nothing else (docs/PARITY.md §3.6).
+// build_request_query_items adds the `name==value` items to the request, which
+// is where `args.params` lands (client.py:373).
+// Query items (`name==value`) and headers (`name:value`) come straight from
+// the item grammar. The query items are the exception for a URL requests
+// never prepared: `prepare_url` encodes them into the URL it is about to
+// prepare (`_encode_params`, models.py:550) and returns *before* that for
+// the short-circuited URL, so they are simply not there — the rendered
+// target keeps the URL's own query and nothing else (docs/PARITY.md §3.6).
+@(private)
+build_request_query_items :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
 	if request.url_kind != .Unprepared {
 		for param in options.item_set.params {
 			if err := http.request_add_query(request, param.name, param.value); err != .None {
@@ -651,26 +767,34 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 			}
 		}
 	}
-	// The item headers are httpie's `args.headers`, and every rule of that dict
-	// lives in the fold the grammar builds for them (cli/items.odin's
-	// header_fold): a repeated name accumulates its values, an item that unsets
-	// a name replaces every value it has, and a name set again after an unset
-	// moves to the end of the dict.
-	//
-	// An *unset* (`Name:` with an empty value, `Header_Item.unset`) is not an
-	// empty-valued header: the reference turns it into a `None`
-	// (requestitems.py:process_header_arg answers `arg.value or None`), which
-	// drops every value of the name, and `finalize_headers` then drops the pair
-	// itself (client.py:190-209) — so the name leaves the request, taking a
-	// repeated item, a session header and one of httpie's defaults with it. The
-	// one exception is urllib3's three skippable names, whose `None` becomes the
-	// SKIP_HEADER sentinel instead: the name stays in the dict so the header
-	// urllib3 would add on its own is suppressed, and both the rendered head and
-	// the wire leave the line out (src/http/skippable.odin). `Name;` is the
-	// empty-valued header and stays one — the two spellings are not the same
-	// thing (docs/PARITY.md §3.1).
-	fold := cli.header_fold(&options.item_set, allocator)
-	defer cli.header_fold_destroy(&fold)
+	return true
+}
+
+// build_request_item_headers folds the item headers into the request.
+// The item headers are httpie's `args.headers`, and every rule of that dict
+// lives in the fold the grammar builds for them (cli/items.odin's
+// header_fold): a repeated name accumulates its values, an item that unsets
+// a name replaces every value it has, and a name set again after an unset
+// moves to the end of the dict.
+//
+// An *unset* (`Name:` with an empty value, `Header_Item.unset`) is not an
+// empty-valued header: the reference turns it into a `None`
+// (requestitems.py:process_header_arg answers `arg.value or None`), which
+// drops every value of the name, and `finalize_headers` then drops the pair
+// itself (client.py:190-209) — so the name leaves the request, taking a
+// repeated item, a session header and one of httpie's defaults with it. The
+// one exception is urllib3's three skippable names, whose `None` becomes the
+// SKIP_HEADER sentinel instead: the name stays in the dict so the header
+// urllib3 would add on its own is suppressed, and both the rendered head and
+// the wire leave the line out (src/http/skippable.odin). `Name;` is the
+// empty-valued header and stays one — the two spellings are not the same
+// thing (docs/PARITY.md §3.1).
+@(private)
+build_request_item_headers :: proc(
+	ctx: ^Context,
+	request: ^http.Request,
+	fold: ^cli.Header_Fold,
+) -> bool {
 	for entry in fold.entries {
 		if entry.unset {
 			// `self[key] = None` drops every value of the name and keeps the
@@ -705,7 +829,11 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 		// — so the first value replaces the stored one and the rest are
 		// appended, in command-line order.
 		start := 0
-		if replace_session_header(request, entry.name, entry.values[0].value) {
+		replaced, replace_err := replace_session_header(request, entry.name, entry.values[0].value)
+		if replace_err != .None {
+			return request_failure(ctx, replace_err)
+		}
+		if replaced {
 			start = 1
 		}
 		for value in entry.values[start:] {
@@ -716,18 +844,40 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 	}
 	// (File fields are added with the data items below: a multipart body is
 	// serialised in command-line order and the two are interleaved there.)
+	return true
+}
 
-	// The merged values lose their surrounding whitespace here, exactly once:
-	// the reference strips every value of the request dict it hands to requests
-	// (`finalize_headers`, client.py:192-209), right after its own defaults, the
-	// session's headers and the items have been merged. Running it at the same
-	// point is what makes the head, the wire and the session file agree — the
-	// session records the headers further down (client.py:75 reads the finalized
-	// ones), and both the renderer and the transport read this same list after
-	// output.order_request_headers has rewritten it.
+// build_request_finalize_headers is the one point the merged values are
+// rewritten at, which is what the head, the wire and the session file agree
+// through.
+// The merged values lose their surrounding whitespace here, exactly once:
+// the reference strips every value of the request dict it hands to requests
+// (`finalize_headers`, client.py:192-209), right after its own defaults, the
+// session's headers and the items have been merged. Running it at the same
+// point is what makes the head, the wire and the session file agree — the
+// session records the headers further down (client.py:75 reads the finalized
+// ones), and both the renderer and the transport read this same list after
+// output.order_request_headers has rewritten it.
+@(private)
+build_request_finalize_headers :: proc(ctx: ^Context, request: ^http.Request) -> bool {
 	if strip_err := http.request_strip_header_values(request); strip_err != .None {
 		return request_error(ctx, request, strip_err)
 	}
+	return true
+}
+
+// build_request_prepared_url_checks runs the three checks requests makes while
+// it prepares the URL and the headers — the encoded query items
+// (`_encode_params`, models.py:550-558), the requote of the whole URL
+// (models.py:560) and `prepare_headers`' `check_header_validity`
+// (models.py:440) — all of them *before* the cookies, the body and the auth, so
+// a refusal ends the run with no head rendered and nothing sent. Each failure
+// leaves through the door the code it came from uses: request_error for the
+// first two, the written message for the third.
+@(private)
+build_request_prepared_url_checks :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
+	allocator := ctx.allocator
 
 	// requests prepares the URL for every invocation, before the body and the
 	// auth, and that is where the query items are encoded (models.py:550,
@@ -764,12 +914,22 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 		output.write_log_error(ctx.log, options.program_name, message)
 		return false
 	}
+	return true
+}
 
-	// The Content-Type item is also the raw material of a multipart body's
-	// Content-Type: client.py:353-358 builds that value from `args.headers` —
-	// the CLI's own items, *not* the session's base headers — so the encoder
-	// gets this one and not the merged header. The first item wins, because
-	// `args.headers.get` reads the first value of a repeated name.
+// build_request_multipart_content_type_item hands the encoder the CLI's own
+// Content-Type item.
+// The Content-Type item is also the raw material of a multipart body's
+// Content-Type: client.py:353-358 builds that value from `args.headers` —
+// the CLI's own items, *not* the session's base headers — so the encoder
+// gets this one and not the merged header. The first item wins, because
+// `args.headers.get` reads the first value of a repeated name.
+@(private)
+build_request_multipart_content_type_item :: proc(
+	ctx: ^Context,
+	request: ^http.Request,
+) -> bool {
+	options := &ctx.options
 	for header in options.item_set.headers {
 		if strings.equal_fold(header.name, "Content-Type") {
 			if err := http.request_set_content_type_item(request, header.value); err != .None {
@@ -778,11 +938,19 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 			break
 		}
 	}
+	return true
+}
 
-	// The body. The item grammar already decided which of the mutually
-	// exclusive sources is in play (docs/PARITY.md section 1.2).
-	// The request type picks how the engine encodes the items.
-	//
+// build_request_body is the body the invocation describes, in the reference's
+// own precedence.
+// The body. The item grammar already decided which of the mutually
+// exclusive sources is in play (docs/PARITY.md section 1.2).
+// The request type picks how the engine encodes the items.
+//
+@(private)
+build_request_body :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
+
 	// A piped stdin is the one source the CLI cannot resolve: it is not an
 	// item, and httpie reads it only here, after the item grammar has run and
 	// only when nothing else supplied the body (argparser.py:735-741).
@@ -792,149 +960,238 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 	request.body_kind = body_kind_of(options.body_kind)
 	switch {
 	case options.item_set.body_file_given:
-		// A bare `@file`: the whole body, typed by the file's extension when the
-		// extension has one. There is no fallback type: when the guess says
-		// nothing the header item is simply not added
-		// (`if content_type: self.args.headers['Content-Type'] = content_type`,
-		// argparser.py:485-488), so the request type's own default — the same
-		// one `--raw` gets — is what the request carries (docs/PARITY.md §3.1).
-		guessed := cli.item_set_body_file_content_type(&options.item_set, allocator)
-		defer if guessed != "" {
-			delete(guessed, allocator)
-		}
-		content_type := guessed
-		if content_type == "" {
-			content_type = raw_content_type(options)
-		}
-		if err := http.request_set_raw_body(request, options.item_set.body_file_contents, content_type); err != .None {
-			return request_failure(ctx, err)
-		}
+		return build_request_body_file(ctx, request)
 	case stdin_body:
-		// The bytes as they arrive, with the content type the request type
-		// implies — the same treatment `--raw` gets.
-		input := read_stdin(allocator)
-		defer delete(input, allocator)
-		if err := http.request_set_raw_body(request, input, raw_content_type(options)); err != .None {
-			return request_failure(ctx, err)
-		}
+		return build_request_body_stdin(ctx, request)
 	case options.body_kind == .Raw:
-		// --raw: the bytes as given, with the content type the request type
-		// implies.
-		raw := options.raw_body
-		content_type := raw_content_type(options)
-		if err := http.request_set_raw_body(request, transmute([]u8)raw, content_type); err != .None {
-			return request_failure(ctx, err)
-		}
+		return build_request_body_raw(ctx, request)
 	case options.item_set.has_data && options.body_kind == .JSON:
-		// The CLI already applied the nested-JSON (bracket) grammar; here the
-		// tree is only serialised, exactly as json.dumps prints it — with the
-		// module *defaults*, which is what json_dict_to_request_body calls
-		// (client.py:311-319): `ensure_ascii=True`, so every character outside
-		// `' '..'~'` is escaped and the Content-Length follows the escapes
-		// (docs/PARITY.md §3.4). The response formatter's dump is the one that
-		// passes ensure_ascii=False.
-		root, message := cli.item_set_json_data(&options.item_set, allocator)
-		if message != "" {
-			// httpie's core.py:81-85: a nested-JSON syntax/type error is written
-			// to stderr as the bare message plus one newline, then exit 1.
-			output.write_raw_bytes(ctx.stderr, transmute([]u8)message)
-			output.write_raw_bytes(ctx.stderr, []u8{'\n'})
-			delete(message, allocator)
-			return false
-		}
-		defer format.value_destroy(&root, allocator)
-		text := format.dump_to_string(&root, format.body_dump_options(), allocator)
-		defer delete(text, allocator)
-		if err := http.request_set_raw_body(request, transmute([]u8)text, http.JSON_CONTENT_TYPE); err != .None {
-			return request_failure(ctx, err)
-		}
+		return build_request_body_json(ctx, request)
 	case options.item_set.has_data:
-		// Data items and file fields, interleaved in command-line order: a
-		// multipart body serialises them in that order (httpie builds
-		// `args.multipart_data` as a dict, and Python's dicts keep insertion
-		// order).
-		//
-		// A multipart body is built from `args.multipart_data` — not from
-		// `args.data` — and only the separators of SEPARATORS_GROUP_MULTIPART
-		// (`=`, `=@`, `@`) are ever put into that dict (requestitems.py:112-113).
-		// A `:=`/`:=@` item is still accepted by the CLI and still lands in
-		// `args.data`, but it contributes no part at all: `--multipart a:=1`
-		// sends the closing line alone (docs/PARITY.md §1.2). The JSON body and
-		// the urlencoded form body are built from `args.data`, so the same item
-		// *does* reach those two roads (a `--form` with no file field is the
-		// urlencoded one); this branch is the only one that drops it.
-		multipart := options.body_kind == .Multipart
-		files := options.item_set.files
-		items := make([]http.Data_Item, len(options.item_set.data) + len(files), allocator)
-		out := 0
-		defer {
-			for item in items[:out] {
-				delete(item.name, allocator)
-				delete(item.value, allocator)
-				delete(item.lone, allocator)
-			}
-			delete(items, allocator)
+		return build_request_body_items(ctx, request)
+	case options.body_kind == .Multipart:
+		return build_request_body_multipart(ctx, request)
+	}
+	return true
+}
+
+	// A bare `@file`: the whole body, typed by the file's extension when the
+	// extension has one. There is no fallback type: when the guess says
+	// nothing the header item is simply not added
+	// (`if content_type: self.args.headers['Content-Type'] = content_type`,
+	// argparser.py:485-488), so the request type's own default — the same
+	// one `--raw` gets — is what the request carries (docs/PARITY.md §3.1).
+@(private)
+build_request_body_file :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
+	allocator := ctx.allocator
+
+	guessed, guessed_ok := cli.item_set_body_file_content_type(&options.item_set, allocator)
+	if !guessed_ok {
+		return request_failure(ctx, .Out_Of_Memory)
+	}
+	defer if guessed != "" {
+		delete(guessed, allocator)
+	}
+	content_type := guessed
+	if content_type == "" {
+		content_type = raw_content_type(options)
+	}
+	if err := http.request_set_raw_body(request, options.item_set.body_file_contents, content_type); err != .None {
+		return request_failure(ctx, err)
+	}
+	return true
+}
+
+	// The bytes as they arrive, with the content type the request type
+	// implies — the same treatment `--raw` gets.
+// (Piped stdin is the one place httpie reads it: argparser.py:735-741.)
+@(private)
+build_request_body_stdin :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
+	allocator := ctx.allocator
+
+	input := read_stdin(allocator)
+	defer delete(input, allocator)
+	if err := http.request_set_raw_body(request, input, raw_content_type(options)); err != .None {
+		return request_failure(ctx, err)
+	}
+	return true
+}
+
+	// --raw: the bytes as given, with the content type the request type
+	// implies.
+// `args.raw` is the whole body and httpie reads it before stdin ever is
+// (`_body_from_input`, argparser.py:182-185).
+@(private)
+build_request_body_raw :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
+
+	raw := options.raw_body
+	content_type := raw_content_type(options)
+	if err := http.request_set_raw_body(request, transmute([]u8)raw, content_type); err != .None {
+		return request_failure(ctx, err)
+	}
+	return true
+}
+
+	// The CLI already applied the nested-JSON (bracket) grammar; here the
+	// tree is only serialised, exactly as json.dumps prints it — with the
+	// module *defaults*, which is what json_dict_to_request_body calls
+	// (client.py:311-319): `ensure_ascii=True`, so every character outside
+	// `' '..'~'` is escaped and the Content-Length follows the escapes
+	// (docs/PARITY.md §3.4). The response formatter's dump is the one that
+	// passes ensure_ascii=False.
+@(private)
+build_request_body_json :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
+	allocator := ctx.allocator
+
+	root, message := cli.item_set_json_data(&options.item_set, allocator)
+	if message != "" {
+		// httpie's core.py:81-85: a nested-JSON syntax/type error is written
+		// to stderr as the bare message plus one newline, then exit 1.
+		output.write_raw_bytes(ctx.stderr, transmute([]u8)message)
+		output.write_raw_bytes(ctx.stderr, []u8{'\n'})
+		delete(message, allocator)
+		return false
+	}
+	defer format.value_destroy(&root, allocator)
+	text := format.dump_to_string(&root, format.body_dump_options(), allocator)
+	defer delete(text, allocator)
+	if err := http.request_set_raw_body(request, transmute([]u8)text, http.JSON_CONTENT_TYPE); err != .None {
+		return request_failure(ctx, err)
+	}
+	return true
+}
+
+	// Data items and file fields, interleaved in command-line order: a
+	// multipart body serialises them in that order (httpie builds
+	// `args.multipart_data` as a dict, and Python's dicts keep insertion
+	// order).
+	//
+	// A multipart body is built from `args.multipart_data` — not from
+	// `args.data` — and only the separators of SEPARATORS_GROUP_MULTIPART
+	// (`=`, `=@`, `@`) are ever put into that dict (requestitems.py:112-113).
+	// A `:=`/`:=@` item is still accepted by the CLI and still lands in
+	// `args.data`, but it contributes no part at all: `--multipart a:=1`
+	// sends the closing line alone (docs/PARITY.md §1.2). The JSON body and
+	// the urlencoded form body are built from `args.data`, so the same item
+	// *does* reach those two roads (a `--form` with no file field is the
+	// urlencoded one); this branch is the only one that drops it.
+// The body is `prepare_request_body`'s (client.py:364-371), over the `data`
+// and `files` the CLI resolved (client.py:336-337).
+@(private)
+build_request_body_items :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
+	allocator := ctx.allocator
+
+	multipart := options.body_kind == .Multipart
+	files := options.item_set.files
+	items := make([]http.Data_Item, len(options.item_set.data) + len(files), allocator)
+	out := 0
+	defer {
+		for item in items[:out] {
+			delete(item.name, allocator)
+			delete(item.value, allocator)
+			delete(item.lone, allocator)
 		}
-		file_index := 0
-		for &item, i in options.item_set.data {
-			for file_index < len(files) && files[file_index].after_data == i {
-				items[out] = file_data_item(files[file_index], allocator)
-				out += 1
-				file_index += 1
+		delete(items, allocator)
+	}
+	file_index := 0
+	for &item, i in options.item_set.data {
+		for file_index < len(files) && files[file_index].after_data == i {
+			file_item, file_ok := file_data_item(files[file_index], allocator)
+			if !file_ok {
+				return request_failure(ctx, .Out_Of_Memory)
 			}
-			if multipart && !(item.sep in cli.MULTIPART_SEPARATORS) {
-				// Not part of multipart_data: the item is skipped *after* the
-				// file fields that sat before it, so the parts that remain
-				// keep their relative order (the file's `after_data` counts
-				// command-line data items, this one included).
-				continue
-			}
-			items[out] = http.Data_Item {
-				kind  = data_item_kind(item.sep),
-				name  = strings.clone(item.key, allocator) or_else "",
-				value = data_item_value(&item, allocator),
-				lone  = data_item_lone(&item, allocator),
-			}
-			out += 1
-		}
-		for file_index < len(files) {
-			items[out] = file_data_item(files[file_index], allocator)
+			items[out] = file_item
 			out += 1
 			file_index += 1
 		}
-		if err := http.request_add_items(request, items[:out]); err != .None {
-			return request_failure(ctx, err)
+		if multipart && !(item.sep in cli.MULTIPART_SEPARATORS) {
+			// Not part of multipart_data: the item is skipped *after* the
+			// file fields that sat before it, so the parts that remain
+			// keep their relative order (the file's `after_data` counts
+			// command-line data items, this one included).
+			continue
 		}
-	case options.body_kind == .Multipart:
-		// `--multipart` without a single data item still sends a body: httpie
-		// hands MultipartEncoder an empty field dict and it emits the closing
-		// `--boundary--\r\n` line alone (38 bytes for a 32-char boundary),
-		// which is what fixes the Content-Length and the boundary. A file
-		// field with no data items is the other shape this case covers.
-		files := options.item_set.files
-		items := make([]http.Data_Item, len(files), allocator)
-		defer {
-			for item in items {
-				delete(item.name, allocator)
-				delete(item.value, allocator)
-			}
-			delete(items, allocator)
+		// Every string of the item is an owned copy and each failure is
+		// reported: `out` has not moved yet, so the deferred loop above
+		// releases exactly the items already stored (backlog M5).
+		item_name, name_ok := http.clone_or_oom(item.key, allocator)
+		if !name_ok {
+			return request_failure(ctx, .Out_Of_Memory)
 		}
-		for file, i in files {
-			items[i] = file_data_item(file, allocator)
+		item_value, value_ok := data_item_value(&item, allocator)
+		if !value_ok {
+			delete(item_name, allocator)
+			return request_failure(ctx, .Out_Of_Memory)
 		}
-		if err := http.request_add_items(request, items); err != .None {
-			return request_failure(ctx, err)
+		items[out] = http.Data_Item {
+			kind  = data_item_kind(item.sep),
+			name  = item_name,
+			value = item_value,
+			lone  = data_item_lone(&item, allocator),
 		}
+		out += 1
 	}
-
-	if options.boundary != "" {
-		delete(request.boundary, allocator)
-		request.boundary = strings.clone(options.boundary, allocator) or_else ""
+	for file_index < len(files) {
+		file_item, file_ok := file_data_item(files[file_index], allocator)
+		if !file_ok {
+			return request_failure(ctx, .Out_Of_Memory)
+		}
+		items[out] = file_item
+		out += 1
+		file_index += 1
 	}
+	if err := http.request_add_items(request, items[:out]); err != .None {
+		return request_failure(ctx, err)
+	}
+	return true
+}
 
-	// Transport policy: http deliberately does not import cli, so the session is
-	// where the two meet (docs/ARCHITECTURE.md).
+	// `--multipart` without a single data item still sends a body: httpie
+	// hands MultipartEncoder an empty field dict and it emits the closing
+	// `--boundary--\r\n` line alone (38 bytes for a 32-char boundary),
+	// which is what fixes the Content-Length and the boundary. A file
+	// field with no data items is the other shape this case covers.
+// The body is `get_multipart_data_and_content_type`'s (client.py:353-358).
+@(private)
+build_request_body_multipart :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
+	allocator := ctx.allocator
+
+	files := options.item_set.files
+	items := make([]http.Data_Item, len(files), allocator)
+	defer {
+		for item in items {
+			delete(item.name, allocator)
+			delete(item.value, allocator)
+		}
+		delete(items, allocator)
+	}
+	for file, i in files {
+		file_item, file_ok := file_data_item(file, allocator)
+		if !file_ok {
+			return request_failure(ctx, .Out_Of_Memory)
+		}
+		items[i] = file_item
+	}
+	if err := http.request_add_items(request, items); err != .None {
+		return request_failure(ctx, err)
+	}
+	return true
+}
+
+// build_request_transport_options copies the transport policy down from the CLI
+// options, `make_send_kwargs`' own (client.py:281-312), plus the verb
+// `prepare_method` took from the command line (client.py:361).
+// Transport policy: http deliberately does not import cli, so the session is
+// where the two meet (docs/ARCHITECTURE.md).
+@(private)
+build_request_transport_options :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
 	request.timeout_s = int(options.timeout_s)
 	request.follow_redirects = options.follow || options.download
 	request.max_redirects = options.max_redirects
@@ -948,18 +1205,33 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 			return request_failure(ctx, err)
 		}
 	}
+	return true
+}
 
-	// client.py:263-278, `auto_json = args.data and not args.form`: either --json
-	// was asked for or the request carries a body that is not form-encoded. That
-	// is what switches the Accept/Content-Type pair on; without it httpie leaves
-	// requests' session default `Accept: */*` in place.
+// build_request_json_accept is httpie's `auto_json`: the flag that switches the
+// Accept/Content-Type pair on.
+// client.py:263-278, `auto_json = args.data and not args.form`: either --json
+// was asked for or the request carries a body that is not form-encoded. That
+// is what switches the Accept/Content-Type pair on; without it httpie leaves
+// requests' session default `Accept: */*` in place.
+@(private)
+build_request_json_accept :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
 	request.json_accept = options.json_given ||
 	                      (request.body_source != .None && !form_like_body(options.body_kind))
-	// `--proxy` entries are `PROTOCOL:PROXY_URL`; requests turns them into a
-	// mapping and picks the one for the request's scheme (client.py:302,
-	// select_proxy). The Request borrows the entry (and cert/cert_key/
-	// cert_key_pass below) — cli.Options keeps ownership of every one of them
-	// and options_destroy frees them (docs/ARCHITECTURE.md §4).
+	return true
+}
+
+// build_request_proxy_and_tls is the connection material the send carries
+// (client.py:288-312).
+// `--proxy` entries are `PROTOCOL:PROXY_URL`; requests turns them into a
+// mapping and picks the one for the request's scheme (client.py:302,
+// select_proxy). The Request borrows the entry (and cert/cert_key/
+// cert_key_pass below) — cli.Options keeps ownership of every one of them
+// and options_destroy frees them (docs/ARCHITECTURE.md §4).
+@(private)
+build_request_proxy_and_tls :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	options := &ctx.options
 	if index := http.proxy_entry_index(request, options.proxy[:]); index >= 0 {
 		request.proxy = options.proxy[index]
 	}
@@ -968,8 +1240,60 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 	request.cert_key_pass = options.cert_key_pass
 	request.ca_bundle = verify_ca_bundle(options.verify)
 	request.ciphers = options.ciphers
+	request.ssl_version = options.ssl_version
+	return true
+}
+
+// build_request_auth is the credentials the request authenticates with, in
+// httpie's own order.
+//
+// False is the run's own refusal to send `user:` with no password, printed
+// here; every other failure goes through request_failure.
+@(private)
+build_request_auth :: proc(
+	ctx: ^Context,
+	request: ^http.Request,
+	session: ^Session,
+) -> bool {
+	options := &ctx.options
+	allocator := ctx.allocator
 	if options.auth != "" {
-		if err := http.request_set_auth(request, options.auth, auth_type_of(options.auth_type)); err != .None {
+		credentials := options.auth
+		credentials_owned := false
+		defer if credentials_owned {
+			delete(credentials, allocator)
+		}
+		// `--auth user` — a username with no password. The reference prompts
+		// for the password there (getpass; the `password or ''` of
+		// argparser.py:289-299 covers only the URL's own userinfo), and
+		// `--auth-type bearer` passes its value through unparsed, so only basic
+		// and digest have a password to be missing. The port has no terminal
+		// layer to prompt with, so the password comes from
+		// $HTTHOR_AUTH_PASSWORD, and a run that has none stops here: sending
+		// `user:` with an empty password silently is a wrong request, not a
+		// prompt (backlog M4).
+		if options.auth_type != .Bearer && !strings.contains(credentials, ":") {
+			password, found := cli.env_get(options.env, cli.AUTH_PASSWORD_ENV)
+			if !found || password == "" {
+				message := fmt.aprintf(
+					"no password for '%s': pass --auth %s:PASSWORD, or set %s",
+					options.auth,
+					options.auth,
+					cli.AUTH_PASSWORD_ENV,
+					allocator = allocator,
+				)
+				defer delete(message, allocator)
+				output.write_log_error(ctx.log, options.program_name, message)
+				return false
+			}
+			with_password, join_err := strings.concatenate({options.auth, ":", password}, allocator)
+			if join_err != .None {
+				return request_failure(ctx, .Out_Of_Memory)
+			}
+			credentials = with_password
+			credentials_owned = true
+		}
+		if err := http.request_set_auth(request, credentials, auth_type_of(options.auth_type)); err != .None {
 			return request_failure(ctx, err)
 		}
 	} else {
@@ -989,7 +1313,10 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 			}
 		}
 		if !applied && session != nil && session_has_auth(session) {
-			credentials, auth_type, has_credentials := session_auth_credentials(session, allocator)
+			credentials, auth_type, has_credentials, auth_err := session_auth_credentials(session, allocator)
+			if auth_err != .None {
+				return request_failure(ctx, auth_err)
+			}
 			if has_credentials {
 				defer delete(credentials, allocator)
 				if err := http.request_set_auth(request, credentials, auth_type); err != .None {
@@ -998,10 +1325,20 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 			}
 		}
 	}
+	return true
+}
 
-	// httpie recomputes the session's stored headers here — from the request
-	// headers it has just merged (client.py:75, sessions.py:200-256) — and
-	// stores the credentials the command line gave it (client.py:77-81).
+// build_request_record_session writes the whole request back into the session.
+// httpie recomputes the session's stored headers here — from the request
+// headers it has just merged (client.py:75, sessions.py:200-256) — and
+// stores the credentials the command line gave it (client.py:77-81).
+@(private)
+build_request_record_session :: proc(
+	ctx: ^Context,
+	request: ^http.Request,
+	session: ^Session,
+) -> bool {
+	options := &ctx.options
 	if session != nil {
 		if !session_record_headers(session, options, request) {
 			return request_failure(ctx, .Out_Of_Memory)
@@ -1010,15 +1347,18 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 			return request_failure(ctx, .Out_Of_Memory)
 		}
 	}
+	return true
+}
 
-	if err := http.request_prepare(request); err != .None {
-		return request_error(ctx, request, err)
-	}
-
-	// httpie's session-level defaults belong on the wire as well as in the
-	// printed head; libcurl cannot know them (it would send a User-Agent of its
-	// own). The header list is then rewritten into the reference's order, which
-	// is what both the transport and the renderer read.
+// build_request_default_headers adds httpie's session-level defaults
+// (`make_default_headers`, client.py:263-278) to the request.
+// httpie's session-level defaults belong on the wire as well as in the
+// printed head; libcurl cannot know them (it would send a User-Agent of its
+// own). The header list is then rewritten into the reference's order, which
+// is what both the transport and the renderer read.
+@(private)
+build_request_default_headers :: proc(ctx: ^Context, request: ^http.Request) -> bool {
+	allocator := ctx.allocator
 	defaults := request_head_defaults(ctx, request)
 	defer delete(defaults.host, allocator)
 	if err := add_default_header(request, "Accept-Encoding", http.ACCEPT_ENCODING); err != .None {
@@ -1030,6 +1370,13 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 	if err := add_default_header(request, "User-Agent", http.USER_AGENT); err != .None {
 		return request_failure(ctx, err)
 	}
+	return true
+}
+
+// build_request_cookies is the jar's own step and the hook a followed hop
+// re-derives it through (client.py:76).
+@(private)
+build_request_cookies :: proc(session: ^Session, request: ^http.Request) {
 	// The jar's cookies are requests' own step (client.py:76: the request
 	// session's jar *is* the httpie session's), so the header joins after
 	// httpie's defaults and before the head is ordered.
@@ -1037,10 +1384,27 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 	// The same jar re-derives that header for every followed hop: a redirect
 	// must not replay the first URL's cookie (http.Cookie_Hook, SF-001).
 	session_cookie_hook(session, request)
-	// The order comes from the headers' provenance, not their names: the
-	// session is the only layer that knows which of them httpie's request dict
-	// carried (see request_own_names and output.order_request_headers).
-	own, own_ok := request_own_names(ctx, session, request, &fold)
+}
+
+// build_request_order_headers rewrites the header list into the reference's
+// order.
+// The order comes from the headers' provenance, not their names: the
+// session is the only layer that knows which of them httpie's request dict
+// carried (see request_own_names and output.order_request_headers).
+//
+// `fold` arrives by pointer rather than being rebuilt here: it is
+// build_request's own table, the item headers and this phase being its only two
+// readers, and `request_own_names` is documented to take it (context.odin).
+@(private)
+build_request_order_headers :: proc(
+	ctx: ^Context,
+	session: ^Session,
+	request: ^http.Request,
+	fold: ^cli.Header_Fold,
+) -> bool {
+	options := &ctx.options
+	allocator := ctx.allocator
+	own, own_ok := request_own_names(ctx, session, request, fold)
 	if !own_ok {
 		return request_failure(ctx, .Out_Of_Memory)
 	}
@@ -1063,22 +1427,31 @@ build_request :: proc(ctx: ^Context, request: ^http.Request, session: ^Session) 
 // name is the session's. It is searched over the whole list rather than over a
 // prefix because an unset can insert a skippable name's sentinel at the front
 // (see the merge in build_request).
+//
+// The copy of the item's value answers `err` as well as `replaced`: the bool
+// alone already means "the name is not in the list", so an out-of-memory had
+// no way to be told apart from it — and reading the failure as "not found"
+// would append a second occurrence instead of replacing the session's
+// (backlog M5).
 @(private)
 replace_session_header :: proc(
 	request: ^http.Request,
 	name: string,
 	value: string,
-) -> bool {
+) -> (replaced: bool, err: http.Error) {
 	for index in 0 ..< len(request.headers) {
 		if !strings.equal_fold(request.headers[index].name, name) {
 			continue
 		}
-		replacement := strings.clone(value, request.allocator) or_else ""
+		replacement, ok := http.clone_or_oom(value, request.allocator)
+		if !ok {
+			return false, .Out_Of_Memory
+		}
 		delete(request.headers[index].value, request.allocator)
 		request.headers[index].value = replacement
-		return true
+		return true, .None
 	}
-	return false
+	return false, .None
 }
 
 // add_default_header adds one of httpie's session-level headers unless the user
@@ -1122,16 +1495,24 @@ read_stdin :: proc(allocator: mem.Allocator) -> []u8 {
 }
 
 // file_data_item is a file field as the engine wants it, with its strings owned
-// so the array it lands in can be freed uniformly.
+// so the array it lands in can be freed uniformly. `ok` is false when a copy
+// could not be made, and the field names are how the caller reports it: an
+// unnamed or path-less file part is a wrong body, not a failure (backlog M5).
 @(private)
-file_data_item :: proc(file: cli.File_Item, allocator: mem.Allocator) -> http.Data_Item {
-	return http.Data_Item {
-		kind     = .File,
-		name     = strings.clone(file.name, allocator) or_else "",
-		value    = strings.clone(file.path, allocator) or_else "",
-		filename = file.filename,
-		mime     = file.mime,
+file_data_item :: proc(file: cli.File_Item, allocator: mem.Allocator) -> (item: http.Data_Item, ok: bool) {
+	item.kind = .File
+	// The filename parameter and the type stay borrowed, as they were: the
+	// caller's release loop frees `name` and `value` only.
+	item.filename = file.filename
+	item.mime = file.mime
+	if !http.clone_into(&item.name, file.name, allocator) {
+		return {}, false
 	}
+	if !http.clone_into(&item.value, file.path, allocator) {
+		delete(item.name, allocator)
+		return {}, false
+	}
+	return item, true
 }
 
 // body_kind_of maps the CLI's request type onto the engine's encoder choice.
@@ -1170,20 +1551,22 @@ data_item_kind :: proc(sep: cli.Sep) -> http.Data_Item_Kind {
 
 // data_item_value is the item's value as the engine wants it: the plain string
 // for a `=` item, and the JSON text for a `:=` item (which the CLI parsed).
+// `ok` is false when the copy could not be made; an empty form value is a
+// legitimate part, so the failure is reported rather than sent (backlog M5).
 //
 // A `:=` string that carries an out-of-band lone surrogate is a `str` to the
 // reference, so what the engine gets is its own bytes with the placeholder U+FFFD
 // standing in for the character — today's bytes, unchanged — and the characters
 // themselves travel beside them through data_item_lone.
 @(private)
-data_item_value :: proc(item: ^cli.Data_Item, allocator: mem.Allocator) -> string {
+data_item_value :: proc(item: ^cli.Data_Item, allocator: mem.Allocator) -> (value: string, ok: bool) {
 	#partial switch v in item.value {
 	case string:
-		return strings.clone(v, allocator) or_else ""
+		return http.clone_or_oom(v, allocator)
 	case format.Surrogate_String:
-		return strings.clone(v.text, allocator) or_else ""
+		return http.clone_or_oom(v.text, allocator)
 	}
-	return format.dump_to_string(&item.value, format.default_dump_options(), allocator)
+	return format.dump_to_string(&item.value, format.default_dump_options(), allocator), true
 }
 
 // data_item_lone translates the out-of-band surrogates of a `:=` item's value
@@ -1289,6 +1672,14 @@ write_config :: proc(ctx: ^Context) -> (config: output.Write_Config, ok: bool) {
 	config.pretty_format = options.pretty == .All || options.pretty == .Format
 	config.pretty_colors = (options.pretty == .All || options.pretty == .Colors) && options.colors != 0
 	config.stdout_is_tty = options.env.stdout_is_tty
+	// `--stream`/`-S` is `ProcessingOptions.stream`: the renderer uses it as
+	// `is_stream` for a reply, which is what takes a prettified body off
+	// `BufferedPrettyStream` and onto the line-oriented `PrettyStream`
+	// (output/writer.py:162-192, render.is_streamed_message).
+	config.stream = options.stream
+	// Terminal safety (backlog M2): a reply's control bytes are replaced on the
+	// way to a terminal unless HTTHOR_ALLOW_TERMINAL_ESCAPES says otherwise.
+	config.allow_terminal_escapes = cli.allow_terminal_escapes(options.env)
 	// `explicit_json` is httpie's `args.json`, which is true whenever the
 	// request type is JSON (cli/argparser.py:198) and false only for --form and
 	// --multipart.
@@ -1392,6 +1783,9 @@ request_own_names :: proc(
 	// Content-Type, httpie's Transfer-Encoding, and a download's assigned
 	// Accept-Encoding — plus one slot per session and item header: once the size
 	// is known every name fits.
+	// M5 report: `or_else nil` is not absorbed — nil is exactly what the
+	// caller's `false` means, so the failed allocation ends the build instead of
+	// building a request with no default headers.
 	names := make([]string, 5 + session_headers + items, allocator) or_else nil
 	if names == nil {
 		return nil, false
@@ -1898,8 +2292,14 @@ download_response :: proc(
 	// below.
 	resumed := options.download_resume && response.status == 206
 	resumed_from := ctx.download_resumed_from
+	// `streamed` is the transport's own count of what it handed to the file: on
+	// that path the body is already on disk, and truncating here would throw it
+	// away. The two cannot both apply — the streaming path is only taken when
+	// the file was opened empty (no `--continue`), so skipping the truncation
+	// costs nothing.
+	streamed := response.body_written > 0
 	if !resumed {
-		if target != nil {
+		if target != nil && !streamed {
 			// The file was opened for appending, so the first write after the
 			// truncation lands at offset 0.
 			_ = os.truncate(target, 0)
@@ -1963,15 +2363,46 @@ download_response :: proc(
 		return int(cli.Exit_Code.Error)
 	}
 
+	// The bytes that went out: the transport wrote them itself on the streamed
+	// path, so its count is the progress number; a body that was buffered
+	// instead (no `-o`, or a `--continue` whose sink is decided by the reply
+	// head) is written here. A short write is a truncated download — the
+	// reference's own write loop would have raised OSError — so it is reported
+	// rather than counted.
 	moved: i64
 	if target != nil {
-		written, write_err := os.write(target, response.body)
-		if write_err != nil {
-			return int(cli.Exit_Code.Error)
+		moved = i64(response.body_written)
+		if len(response.body) > 0 {
+			written, write_err := os.write(target, response.body)
+			if write_err != nil || written != len(response.body) {
+				message := fmt.aprintf(
+					"could not write the whole reply body to %s",
+					name,
+					allocator = allocator,
+				)
+				defer delete(message, allocator)
+				output.write_log_error(ctx.log, options.program_name, message)
+				return int(cli.Exit_Code.Error)
+			}
+			moved += i64(written)
 		}
-		moved = i64(written)
 	} else if len(response.body) > 0 {
-		if err := output.write_raw_bytes(ctx.stdout, response.body); err != .None {
+		// The body of a `--download` that goes to stdout: the renderer never
+		// sees it, so the terminal sanitiser runs here — and only when stdout
+		// really is a terminal, so a pipe or a redirect still gets every byte
+		// (backlog M2). The progress count is the body's own length either way.
+		body := response.body
+		body_owned := false
+		defer if body_owned {
+			delete(body, allocator)
+		}
+		if options.env.stdout_is_tty && !cli.allow_terminal_escapes(options.env) {
+			if sanitized, sanitized_owned := output.sanitize_terminal_bytes(response.body, allocator); sanitized_owned {
+				body = sanitized
+				body_owned = true
+			}
+		}
+		if err := output.write_raw_bytes(ctx.stdout, body); err != .None {
 			return int(cli.Exit_Code.Error)
 		}
 		moved = i64(len(response.body))

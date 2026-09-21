@@ -674,9 +674,9 @@ namespace_create :: proc(allocator: mem.Allocator) -> Namespace {
 	}
 	// The string defaults are owned copies: namespace_destroy frees every string
 	// field, so a literal here would be freed as well.
-	set_owned(&ns.style, "auto", allocator)
-	set_owned(&ns.verify, "yes", allocator)
-	set_owned(&ns.default_scheme, "http", allocator)
+	http.clone_into(&ns.style, "auto", allocator)
+	http.clone_into(&ns.verify, "yes", allocator)
+	http.clone_into(&ns.default_scheme, "http", allocator)
 	return ns
 }
 
@@ -731,23 +731,14 @@ namespace_destroy :: proc(ns: ^Namespace) {
 	ns^ = {}
 }
 
-// set_owned replaces an owned string field, releasing the previous value.
-@(private)
-set_owned :: proc(field: ^string, value: string, allocator: mem.Allocator) -> bool {
-	clone, err := strings.clone(value, allocator)
-	if err != .None {
-		return false
-	}
-	delete(field^, allocator)
-	field^ = clone
-	return true
-}
-
-// append_owned appends a copy of `value` to a dynamic string list.
+// append_owned appends a copy of `value` to a dynamic string list. False means
+// the copy could not be made (out of memory), which the callers report: the
+// copy goes through http.clone_or_oom, so a failed allocation is not read as
+// the legitimate empty string it would otherwise look like (backlog M5).
 @(private)
 append_owned :: proc(list: ^[dynamic]string, value: string, allocator: mem.Allocator) -> bool {
-	clone, err := strings.clone(value, allocator)
-	if err != .None {
+	clone, ok := http.clone_or_oom(value, allocator)
+	if !ok {
 		return false
 	}
 	append(list, clone)
@@ -1366,22 +1357,22 @@ apply_action :: proc(p: ^Parser, action: int, args: []string, option_string: str
 		case:
 		}
 	case .Boundary:
-		if !set_owned(&ns.boundary, value, allocator) {
+		if !http.clone_into(&ns.boundary, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Raw:
-		if !set_owned(&ns.raw, value, allocator) {
+		if !http.clone_into(&ns.raw, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 		ns.raw_set = true
 	case .Compress:
 		ns.compress += 1
 	case .Prettify:
-		if !set_owned(&ns.prettify, value, allocator) {
+		if !http.clone_into(&ns.prettify, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Style:
-		if !set_owned(&ns.style, value, allocator) {
+		if !http.clone_into(&ns.style, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Format_Options:
@@ -1395,11 +1386,11 @@ apply_action :: proc(p: ^Parser, action: int, args: []string, option_string: str
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Response_Charset:
-		if !set_owned(&ns.response_charset, value, allocator) {
+		if !http.clone_into(&ns.response_charset, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Response_Mime:
-		if !set_owned(&ns.response_mime, value, allocator) {
+		if !http.clone_into(&ns.response_mime, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Output_Options:
@@ -1413,17 +1404,17 @@ apply_action :: proc(p: ^Parser, action: int, args: []string, option_string: str
 			letters = "m"
 		case:
 		}
-		if !set_owned(&ns.output_options, letters, allocator) {
+		if !http.clone_into(&ns.output_options, letters, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 		ns.output_options_set = true
 	case .Output_Options_History:
-		if !set_owned(&ns.output_options_history, value, allocator) {
+		if !http.clone_into(&ns.output_options_history, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 		ns.output_options_history_set = true
 	case .Output_File:
-		if !set_owned(&ns.output_file, value, allocator) {
+		if !http.clone_into(&ns.output_file, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 		ns.output_file_set = true
@@ -1440,22 +1431,22 @@ apply_action :: proc(p: ^Parser, action: int, args: []string, option_string: str
 	case .Stream:
 		ns.stream = true
 	case .Session:
-		if !set_owned(&ns.session, value, allocator) {
+		if !http.clone_into(&ns.session, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 		ns.session_seen = true
 	case .Session_Read_Only:
-		if !set_owned(&ns.session_read_only, value, allocator) {
+		if !http.clone_into(&ns.session_read_only, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 		ns.session_read_only_seen = true
 	case .Auth:
-		if !set_owned(&ns.auth, value, allocator) {
+		if !http.clone_into(&ns.auth, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 		ns.auth_seen = true
 	case .Auth_Type:
-		if !set_owned(&ns.auth_type, value, allocator) {
+		if !http.clone_into(&ns.auth_type, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 		ns.auth_type_seen = true
@@ -1486,27 +1477,27 @@ apply_action :: proc(p: ^Parser, action: int, args: []string, option_string: str
 	case .Chunked:
 		ns.chunked = true
 	case .Verify:
-		if !set_owned(&ns.verify, value, allocator) {
+		if !http.clone_into(&ns.verify, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Ssl_Version:
-		if !set_owned(&ns.ssl_version, value, allocator) {
+		if !http.clone_into(&ns.ssl_version, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Ciphers:
-		if !set_owned(&ns.ciphers, value, allocator) {
+		if !http.clone_into(&ns.ciphers, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Cert:
-		if !set_owned(&ns.cert, value, allocator) {
+		if !http.clone_into(&ns.cert, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Cert_Key:
-		if !set_owned(&ns.cert_key, value, allocator) {
+		if !http.clone_into(&ns.cert_key, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Cert_Key_Pass:
-		if !set_owned(&ns.cert_key_pass, value, allocator) {
+		if !http.clone_into(&ns.cert_key_pass, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 	case .Ignore_Stdin:
@@ -1523,7 +1514,7 @@ apply_action :: proc(p: ^Parser, action: int, args: []string, option_string: str
 	case .Traceback:
 		ns.traceback = true
 	case .Default_Scheme:
-		if !set_owned(&ns.default_scheme, value, allocator) {
+		if !http.clone_into(&ns.default_scheme, value, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
 		}
 		ns.default_scheme_set = true
@@ -1552,7 +1543,7 @@ apply_positional :: proc(p: ^Parser, kind: Pos_Kind, raw_args: []string) -> stri
 		ns.method = ""
 		ns.method_seen = false
 		if len(args) == 1 {
-			if !set_owned(&ns.method, args[0], allocator) {
+			if !http.clone_into(&ns.method, args[0], allocator) {
 				return strings.clone("not enough memory", allocator) or_else ""
 			}
 			ns.method_seen = true
@@ -1562,7 +1553,7 @@ apply_positional :: proc(p: ^Parser, kind: Pos_Kind, raw_args: []string) -> stri
 		ns.url = ""
 		ns.url_seen = false
 		if len(args) == 1 {
-			if !set_owned(&ns.url, args[0], allocator) {
+			if !http.clone_into(&ns.url, args[0], allocator) {
 				return strings.clone("not enough memory", allocator) or_else ""
 			}
 			ns.url_seen = true
@@ -1832,7 +1823,7 @@ reset_option :: proc(p: ^Parser, name: string) -> bool {
 			delete(ns.prettify, allocator)
 			ns.prettify = ""
 		case .Style:
-			set_owned(&ns.style, "auto", allocator)
+			http.clone_into(&ns.style, "auto", allocator)
 		case .Format_Options:
 			for option in ns.format_options {
 				delete(option, allocator)
@@ -1909,7 +1900,7 @@ reset_option :: proc(p: ^Parser, name: string) -> bool {
 		case .Chunked:
 			ns.chunked = false
 		case .Verify:
-			set_owned(&ns.verify, "yes", allocator)
+			http.clone_into(&ns.verify, "yes", allocator)
 		case .Ssl_Version:
 			delete(ns.ssl_version, allocator)
 			ns.ssl_version = ""
@@ -1930,7 +1921,7 @@ reset_option :: proc(p: ^Parser, name: string) -> bool {
 		case .Traceback:
 			ns.traceback = false
 		case .Default_Scheme:
-			set_owned(&ns.default_scheme, "http", allocator)
+			http.clone_into(&ns.default_scheme, "http", allocator)
 			ns.default_scheme_set = false
 		case .Debug:
 			ns.debug = false
@@ -2115,7 +2106,7 @@ repr_message :: proc(allocator: mem.Allocator, prefix, value, tail: string) -> s
 @(private)
 config_dir :: proc(env: Env_Info, allocator: mem.Allocator) -> (string, bool) {
 	if value, found := env_get(env, "HTTPIE_CONFIG_DIR"); found && value != "" {
-		return strings.clone(value, allocator) or_else "", true
+		return http.clone_or_oom(value, allocator)
 	}
 	home, has_home := env_get(env, "HOME")
 	if !has_home || home == "" {
@@ -2980,8 +2971,12 @@ process :: proc(p: ^Parser, opts: ^Options) -> string {
 	opts.format_options = format_options
 	opts.body_kind = body_kind_from(ns, &opts.item_set)
 	opts.json_given = ns.request_type == .Json
-	opts.raw_body = strings.clone(ns.raw, allocator) or_else ""
-	opts.boundary = strings.clone(ns.boundary, allocator) or_else ""
+	if !http.clone_into(&opts.raw_body, ns.raw, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	if !http.clone_into(&opts.boundary, ns.boundary, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
 	opts.compress = ns.compress
 	opts.chunked = ns.chunked
 	opts.ignore_stdin = ns.ignore_stdin
@@ -2993,18 +2988,32 @@ process :: proc(p: ^Parser, opts: ^Options) -> string {
 	opts.download = ns.download
 	opts.download_resume = ns.download_resume
 	opts.check_status = ns.check_status
-	opts.output_file = strings.clone(ns.output_file, allocator) or_else ""
+	if !http.clone_into(&opts.output_file, ns.output_file, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
 	opts.print = print_set_from_string(output_options)
 	opts.print_history = print_set_from_string(history_options)
 	opts.print_given = ns.output_options_set || ns.verbose > 0
 	opts.print_history_given = ns.output_options_history_set
-	opts.style = strings.clone(ns.style, allocator) or_else ""
+	if !http.clone_into(&opts.style, ns.style, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
 	opts.style_given = ns.style != "auto"
-	opts.response_charset = strings.clone(ns.response_charset, allocator) or_else ""
-	opts.response_mime = strings.clone(ns.response_mime, allocator) or_else ""
-	opts.session = strings.clone(ns.session, allocator) or_else ""
-	opts.session_read_only = strings.clone(ns.session_read_only, allocator) or_else ""
-	opts.auth = strings.clone(ns.auth, allocator) or_else ""
+	if !http.clone_into(&opts.response_charset, ns.response_charset, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	if !http.clone_into(&opts.response_mime, ns.response_mime, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	if !http.clone_into(&opts.session, ns.session, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	if !http.clone_into(&opts.session_read_only, ns.session_read_only, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	if !http.clone_into(&opts.auth, ns.auth, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
 	opts.auth_type = auth_type_from_string(ns.auth_type)
 	opts.ignore_netrc = ns.ignore_netrc
 	opts.offline = ns.offline
@@ -3014,18 +3023,33 @@ process :: proc(p: ^Parser, opts: ^Options) -> string {
 	opts.timeout_s = ns.timeout
 	opts.timeout_given = ns.timeout_set
 	opts.path_as_is = ns.path_as_is
-	opts.verify = strings.clone(ns.verify, allocator) or_else ""
-	opts.ciphers = strings.clone(ns.ciphers, allocator) or_else ""
-	opts.cert = strings.clone(ns.cert, allocator) or_else ""
-	opts.cert_key = strings.clone(ns.cert_key, allocator) or_else ""
-	opts.cert_key_pass = strings.clone(ns.cert_key_pass, allocator) or_else ""
+	if !http.clone_into(&opts.verify, ns.verify, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	if !http.clone_into(&opts.ciphers, ns.ciphers, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	if !http.clone_into(&opts.ssl_version, ns.ssl_version, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	if !http.clone_into(&opts.cert, ns.cert, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	if !http.clone_into(&opts.cert_key, ns.cert_key, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	if !http.clone_into(&opts.cert_key_pass, ns.cert_key_pass, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
 	opts.show_help = ns.help
 	opts.show_manual = ns.manual
 	opts.show_version = ns.version
 	opts.meta_action = ns.meta_action
 	opts.show_traceback = ns.traceback
 	opts.show_debug = ns.debug
-	opts.url = strings.clone(ns.url, allocator) or_else ""
+	if !http.clone_into(&opts.url, ns.url, allocator) {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
 	for entry in ns.proxy {
 		if !append_owned(&opts.proxy, entry, allocator) {
 			return strings.clone("not enough memory", allocator) or_else ""
@@ -3047,7 +3071,11 @@ process :: proc(p: ^Parser, opts: ^Options) -> string {
 	// requests' PreparedRequest.prepare_method uppercases whatever method it
 	// was given, and httpie hands it `args.method.lower()`; the request line and
 	// the wire therefore carry the upper-cased verb.
-	opts.method_raw = strings.to_upper(method_text, allocator) or_else ""
+	method_raw, method_err := strings.to_upper(method_text, allocator)
+	if method_err != .None {
+		return strings.clone("not enough memory", allocator) or_else ""
+	}
+	opts.method_raw = method_raw
 	return ""
 }
 
@@ -3183,8 +3211,20 @@ auth_type_from_string :: proc(value: string) -> Auth_Type {
 // warning ahead of the usage block a bad command line produces.
 parse_args_with :: proc(env: Env_Info, argv: []string, allocator: mem.Allocator) -> (Options, Parse_Error, string) {
 	program_name := program_name_of(argv)
-	opts := options_default(allocator, program_name)
-	opts.env = env_info_clone(env, allocator)
+	// Both builders are copies all the way down: a failure here is the parser's
+	// own out-of-memory wording, reported as an exception line rather than as a
+	// usage block (backlog M5). The config warning is not read yet on this path,
+	// which is what the empty third result says.
+	opts, opts_ok := options_default(allocator, program_name)
+	if !opts_ok {
+		return {}, exception_error(allocator, strings.clone("not enough memory", allocator) or_else ""), ""
+	}
+	cloned_env, env_ok := env_info_clone(env, allocator)
+	if !env_ok {
+		options_destroy(&opts)
+		return {}, exception_error(allocator, strings.clone("not enough memory", allocator) or_else ""), ""
+	}
+	opts.env = cloned_env
 	opts.colors = colors_from_env(env)
 	// The width main.odin wraps the usage block to. It is decided once, here,
 	// because the error paths below release the partial Options — and with them

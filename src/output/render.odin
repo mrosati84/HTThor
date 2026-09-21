@@ -30,6 +30,7 @@ import "core:fmt"
 import "core:io"
 import "core:mem"
 import "core:strings"
+import "core:unicode/utf8"
 
 import "src:format"
 import "src:http"
@@ -56,6 +57,14 @@ Write_Config :: struct {
 	// The two --pretty groups (httpie/output/processing.py:6-23).
 	pretty_format: bool,
 	pretty_colors: bool,
+
+	// stream is `--stream` / `-S`, the reference's
+	// `ProcessingOptions.stream`: it sets `is_stream` for every message
+	// unconditionally, where the flag's absence leaves that to the
+	// `Content-Type: text/event-stream` auto-check (output/writer.py:162-171).
+	// `is_stream` picks the stream class (writer.py:172-192), and
+	// `is_streamed_message` is where the renderer reads it.
+	stream: bool,
 
 	// The resolved --style: the escape tables plus the header lexer they came
 	// from (output/formatters/colors.py:64-96).
@@ -86,6 +95,13 @@ Write_Config :: struct {
 	charset_error: string,
 
 	stdout_is_tty: bool,
+
+	// allow_terminal_escapes turns the terminal sanitiser off: it is
+	// `HTTHOR_ALLOW_TERMINAL_ESCAPES` in the environment, and it exists because
+	// sanitising is a deliberate divergence from httpie (see
+	// sanitize_terminal_text). With it unset — the default — a reply's control
+	// bytes are replaced by U+FFFD before they reach a terminal.
+	allow_terminal_escapes: bool,
 }
 
 // resolve_style maps a --style name and the terminal's colour count to the
@@ -280,6 +296,8 @@ order_request_headers :: proc(
 	if len(req.headers) < 2 {
 		return true
 	}
+	// M5 report: `or_else nil` is not absorbed — nil is exactly what the
+	// caller's `false` means here.
 	ranks := make([]int, len(req.headers), allocator) or_else nil
 	if ranks == nil {
 		return false
@@ -452,6 +470,11 @@ split_cookie_next :: proc(value: string) -> (piece: string, rest: string, more: 
 // result.
 format_headers_sort :: proc(head: string, allocator: mem.Allocator) -> string {
 	if !strings.contains(head, "\r\n") {
+		// M5 keep: this proc answers a string and its only caller is
+		// write_head, whose pair (io.Error, Str_Encode_Error) reports what the
+		// *writer* refused — there is no io.Error for a failed allocation, so
+		// the copy stays and the site is part of this sweep's recorded
+		// residual (the caller's `owned` flag needs a string it may release).
 		return strings.clone(head, allocator) or_else ""
 	}
 	lines := make([dynamic]string, 0, 16, allocator)
@@ -485,10 +508,12 @@ format_headers_sort :: proc(head: string, allocator: mem.Allocator) -> string {
 		}
 		strings.write_string(&builder, line)
 	}
-	// The builder's buffer is handed over as a *copy*: the caller must own a
-	// string that outlives this proc's locals.
-	result := strings.clone(strings.to_string(builder), allocator) or_else ""
-	strings.builder_destroy(&builder)
+	// The builder's buffer *is* the result: it is handed over as the caller's
+	// string (the builder is zeroed so nothing is left to destroy), which is
+	// what removes the copy — and with it the only allocation in this proc that
+	// could fail (backlog M5).
+	result := strings.to_string(builder)
+	builder = {}
 	return result
 }
 
@@ -604,8 +629,11 @@ format_json_body :: proc(body: string, mime: string, cfg: ^Write_Config) -> (tex
 	// handed over as a string (json.odin:628-634).
 	defer delete(dumped, cfg.allocator)
 	strings.write_string(&builder, dumped)
-	result := strings.clone(strings.to_string(builder), cfg.allocator) or_else ""
-	strings.builder_destroy(&builder)
+	// The builder's buffer *is* the result: handed over as the caller's string
+	// (the builder is zeroed so nothing is left to destroy), which removes the
+	// copy and the allocation that could fail with it (backlog M5).
+	result := strings.to_string(builder)
+	builder = {}
 	return result, true
 }
 
@@ -717,12 +745,19 @@ write_request :: proc(
 		}
 	}
 	if parts.body && len(req.body) > 0 {
+		// `is_stream` is true here too when `--stream` was passed, and it is
+		// asked with `false` because it changes nothing for a request: its
+		// `iter_lines` yields the whole body as one line, and with no line feed
+		// (models.py:136-137), so `PrettyStream` and `BufferedPrettyStream`
+		// write the same bytes for it — and the `text/event-stream` auto-check
+		// is a response's (writer.py:164).
 		if err := write_body(
 			w,
 			string(req.body),
 			content_type_media(req.body_content_type),
 			decode_charset,
 			output_charset,
+			false,
 			cfg,
 		); err != .None {
 			return err
@@ -775,11 +810,26 @@ write_response :: proc(
 		defer if text_owned {
 			delete(text, cfg.allocator)
 		}
+		// Terminal safety, the head's half: a header value (or the reason
+		// phrase, which the server also chooses) is the other place a reply can
+		// carry a CSI or an OSC 52, and with -v/--all the injected line joins
+		// the same stream (sanitize_terminal_text).
+		printed := text
+		printed_owned := false
+		defer if printed_owned {
+			delete(printed, cfg.allocator)
+		}
+		if cfg.stdout_is_tty && !cfg.allow_terminal_escapes {
+			if sanitized, sanitized_owned := sanitize_terminal_text(text, cfg.allocator); sanitized_owned {
+				printed = sanitized
+				printed_owned = true
+			}
+		}
 		codec, resolved := resolve_printed_pretty_codec(output_charset, cfg)
 		if !resolved {
 			return .None
 		}
-		err, failure := write_head(w, text, cfg, codec)
+		err, failure := write_head(w, printed, cfg, codec)
 		if failure.failed {
 			record_charset_failure(cfg, &failure)
 			return .None
@@ -790,7 +840,18 @@ write_response :: proc(
 	}
 	if parts.body {
 		mime := mime_of_response(res, cfg)
-		if err := write_body(w, string(res.body), mime, decode_charset, output_charset, cfg); err != .None {
+		// `is_stream` for this reply — `--stream`, or a `Content-Type:
+		// text/event-stream` of its own (writer.py:162-171).
+		streamed := is_streamed_message(cfg, mime)
+		if err := write_body(
+			w,
+			string(res.body),
+			mime,
+			decode_charset,
+			output_charset,
+			streamed,
+			cfg,
+		); err != .None {
 			return err
 		}
 	}
@@ -884,6 +945,11 @@ write_head :: proc(
 		// ColorsFormatter.format_headers strips the highlighted result
 		// (output/formatters/colors.py:87-93), and the coloured text replaces
 		// the sorted one — as a copy that outlives the builder.
+		// M5 keep: the copy is what makes the result releasable — the stripped
+		// text is a *slice* of the builder's buffer, and that buffer cannot be
+		// handed over the way the whole-buffer sites above do (a `delete` of an
+		// interior slice is not the same allocation). The site is recorded in
+		// the backlog row.
 		colored := strings.clone(strip_whitespace(strings.to_string(builder)), cfg.allocator) or_else ""
 		strings.builder_destroy(&builder)
 		lexed_destroy(&lexed, cfg.allocator)
@@ -924,6 +990,19 @@ record_charset_failure :: proc(cfg: ^Write_Config, failure: ^http.Str_Encode_Err
 // the one `smart_encode` writes with (printed_decode_charset /
 // printed_output_charset); both are "" for "utf-8", and both are resolved — and,
 // if the registry has no text codec under them, refused — here.
+//
+// `streamed` is `is_stream` for this message (is_streamed_message) and it is
+// what the reference's `get_stream_type_and_kwargs` selects the stream class
+// with: a prettify group puts a streamed message in the line-oriented
+// `PrettyStream` and a buffered one in `BufferedPrettyStream`
+// (output/writer.py:192). The two streams differ where this port can observe
+// them — the line-oriented one yields no line for an empty body, resolves no
+// encoder for it, and ends every line it yields with a line feed
+// (output/streams.py:198-226) — and that is what `buffered_pretty_body` and
+// `streamed_lf` below model. What this port cannot reproduce is the reference's
+// *per-line* processing of a non-empty body, which is a consequence of reading
+// the body off the socket a line at a time: the transport hands the renderer a
+// complete body (README.md, *Status and limitations*, `--stream`).
 @(private)
 write_body :: proc(
 	w: io.Writer,
@@ -931,6 +1010,7 @@ write_body :: proc(
 	mime: string,
 	decode_charset: string,
 	output_charset: string,
+	streamed: bool,
 	cfg: ^Write_Config,
 ) -> io.Error {
 	if len(body) == 0 {
@@ -942,8 +1022,9 @@ write_body :: proc(
 		// build/probe_t_aff4fc91_emptycodec.py), where the encoder's lookup always
 		// happens (`''.encode('utf-8-sig')` is the BOM itself). The line-oriented
 		// streams — `EncodedStream` on a terminal, `PrettyStream` for an event
-		// stream, `RawStream` — see no line and resolve nothing.
-		if !buffered_pretty_body(cfg, mime) {
+		// stream or under `--stream`, `RawStream` — see no line and resolve
+		// nothing.
+		if !buffered_pretty_body(cfg, streamed) {
 			return .None
 		}
 		return write_printed_body(w, "", output_charset, cfg)
@@ -981,6 +1062,20 @@ write_body :: proc(
 		}
 		text, owned = decode_printed_part(text, decode_charset, cfg.allocator)
 	}
+	// Terminal safety: the body's own control bytes are replaced before
+	// anything else reads the text, so the formatter, the lexer and the
+	// terminal all see U+FFFD instead of a screen clear, a cursor move or an
+	// OSC 52 clipboard write (sanitize_terminal_text). Applied to the *decoded*
+	// text, which is how a `charset=latin-1` reply's 8-bit CSI is caught too.
+	if cfg.stdout_is_tty && !cfg.allow_terminal_escapes {
+		if sanitized, sanitized_owned := sanitize_terminal_text(text, cfg.allocator); sanitized_owned {
+			if owned {
+				delete(text, cfg.allocator)
+			}
+			text = sanitized
+			owned = true
+		}
+	}
 	if cfg.pretty_format {
 		// `format_body` reports whether it allocated a replacement; without
 		// that flag a formatted body that happens to render to the same bytes
@@ -993,11 +1088,32 @@ write_body :: proc(
 			owned = true
 		}
 	}
+	// The line feed the line-oriented stream ends every line with: `PrettyStream`
+	// yields `process_body(line) + lf` (streams.py:216) and a *response*'s
+	// `iter_lines` gives every line the LF (models.py:67-68), so a streamed body
+	// whose last line carries no line break of its own gains one — where
+	// `BufferedPrettyStream` yields the body as one chunk and adds nothing
+	// (:238-250). The class is picked only when a prettify group applies
+	// (writer.py:192; with none the stream is `RawStream` or `EncodedStream`,
+	// whose own line feed the branch below writes). The test is on the text the
+	// stream carries — the decoded body, the same operand the branch below uses;
+	// the reference asks it of the wire bytes — and it is asked here, before the
+	// formatter runs, because `+ lf` appends to the *unformatted* line and is
+	// written after the formatter, which is where `text` is written.
+	streamed_lf := streamed &&
+		(cfg.pretty_format || cfg.pretty_colors) &&
+		!strings.has_suffix(text, "\n")
 	if cfg.pretty_colors {
 		builder := strings.builder_make(cfg.allocator)
 		defer strings.builder_destroy(&builder)
 		colorize_body(text, mime, cfg, &builder)
-		return write_printed_body(w, strings.to_string(builder), output_charset, cfg)
+		if err := write_printed_body(w, strings.to_string(builder), output_charset, cfg); err != .None {
+			return err
+		}
+		if streamed_lf {
+			return write_str(w, "\n")
+		}
+		return .None
 	}
 	if !cfg.pretty_format && cfg.stdout_is_tty && !strings.has_suffix(text, "\n") {
 		// EncodedStream walks the body by line and always writes an LF
@@ -1007,28 +1123,58 @@ write_body :: proc(
 		}
 		return write_str(w, "\n")
 	}
-	return write_printed_body(w, text, output_charset, cfg)
+	if err := write_printed_body(w, text, output_charset, cfg); err != .None {
+		return err
+	}
+	if streamed_lf {
+		return write_str(w, "\n")
+	}
+	return .None
 }
 
-// buffered_pretty_body is the stream a prettify group puts a message in when its
-// content is not streamed: `BufferedPrettyStream` reads the whole body before
-// printing it, where an event stream's body arrives a line at a time and gets
-// `PrettyStream` instead (writer.py:182-192).
+// buffered_pretty_body is the stream a prettify group puts a message in when the
+// message is not streamed: `PrettyStream if is_stream else BufferedPrettyStream`
+// (writer.py:192), and `BufferedPrettyStream` is the one that reads the whole
+// body before printing it (:238-250) — which is why it is also the one that
+// processes a body the message does not have. `streamed` is `is_stream` for this
+// message (is_streamed_message); it is false for a request, whose `iter_lines`
+// yields its whole body as one line with no line feed and therefore reads the
+// same in either stream (models.py:136-137).
 @(private)
-buffered_pretty_body :: proc(cfg: ^Write_Config, mime: string) -> bool {
-	return (cfg.pretty_format || cfg.pretty_colors) && !stream_mime(mime)
+buffered_pretty_body :: proc(cfg: ^Write_Config, streamed: bool) -> bool {
+	return (cfg.pretty_format || cfg.pretty_colors) && !streamed
 }
 
-// stream_mime is the reference's auto-stream check (writer.py:163-171): a
+// stream_mime is the reference's auto-stream check (writer.py:164-171): a
 // *response* whose `Content-Type` is `text/event-stream` is printed line by line
 // by `PrettyStream`, which is why an empty body never reaches its formatter or
-// its encoder. `--stream` forces that stream for any content, and the mime here
-// is the effective one (`--response-mime` included); the port does not model
-// either, which is part of the streamed-body gap docs/PARITY.md section 3.4
-// records.
+// its encoder. The mime here is the effective one (`--response-mime` included).
 @(private)
 stream_mime :: proc(mime: string) -> bool {
 	return strings.equal_fold(mime, "text/event-stream")
+}
+
+// is_streamed_message is `is_stream` for a message (output/writer.py:162-171):
+// `--stream`/`-S` sets it for every message (`is_stream =
+// processing_options.stream`), and without the flag it is the auto-stream check
+// above, which the reference makes for a *response* only (`if not is_stream and
+// message_type is HTTPResponse`). It is asked once per response — what it
+// selects is the stream class (writer.py:172-192), and the renderer reads it
+// where that choice shows: `buffered_pretty_body` and `write_body`'s
+// `streamed_lf`. A request asks it with `false`, because the choice makes no
+// difference there (see `buffered_pretty_body`).
+//
+// The part of `--stream` this does *not* reach is the arrival timing the flag's
+// help text advertises: the reference reads the reply off the socket and
+// `--stream` shrinks the read to one byte at a time
+// (`RawStream.CHUNK_SIZE_BY_LINE`, writer.py:172-180), which is what makes
+// `tail -f` of a live stream possible. This port's transport hands the renderer
+// a complete body — the sink that does reach bytes as they arrive is
+// `--download`'s (`http.send_to`) — so the flag selects the stream here without
+// shortening the wait (README.md, *Status and limitations*).
+@(private)
+is_streamed_message :: proc(cfg: ^Write_Config, mime: string) -> bool {
+	return cfg.stream || stream_mime(mime)
 }
 
 // write_printed_body writes the text one printed body part ended up with,
@@ -1563,9 +1709,103 @@ write_log_line :: proc(
 }
 
 // ---------------------------------------------------------------------------
-// Small helpers
+// Terminal safety
 // ---------------------------------------------------------------------------
 
+// sanitize_terminal_text replaces every character a terminal would *act on*
+// instead of drawing with U+FFFD, and hands back the input unchanged when there
+// is nothing to replace (so the ordinary case allocates nothing).
+//
+// What it catches: the C0 controls (TAB and LF stay; a CR stays only as the CR
+// of a CRLF pair, because a lone CR returns the cursor to the start of the line
+// and lets a reply overwrite what was just printed), DEL, the C1 controls
+// U+0080–U+009F — the 8-bit CSI/OSC/DCS of a `charset=latin-1` reply decode into
+// one, and a terminal reads U+009B as the same CSI as `ESC [` — and any byte
+// that is not valid UTF-8. ESC itself is in the C0 range, so an OSC 52
+// clipboard write, a screen clear and a cursor move all lose their introducer.
+//
+// This is a deliberate divergence from httpie, which writes the server's bytes
+// through unfiltered: a reply must not be able to clear the screen, forge
+// output, or read the clipboard of the terminal it is printed to. It applies
+// only when the destination is a terminal (`Write_Config.stdout_is_tty`), so
+// pipes, files and `--download` targets keep their bytes exactly, and
+// `HTTHOR_ALLOW_TERMINAL_ESCAPES` turns it off for the raw-output case.
+sanitize_terminal_text :: proc(text: string, allocator: mem.Allocator) -> (string, bool) {
+	replacements := 0
+	for index := 0; index < len(text); {
+		size, unsafe := terminal_sequence(text, index)
+		if unsafe {
+			replacements += 1
+		}
+		index += size
+	}
+	if replacements == 0 {
+		return text, false
+	}
+	// U+FFFD is three bytes, so the copy needs two spare bytes per replaced one.
+	printed := make([]u8, len(text) + replacements * 2, allocator)
+	position := 0
+	for index := 0; index < len(text); {
+		size, unsafe := terminal_sequence(text, index)
+		if unsafe {
+			printed[position] = 0xEF
+			printed[position + 1] = 0xBF
+			printed[position + 2] = 0xBD
+			position += 3
+		} else {
+			copy(printed[position:], text[index:index + size])
+			position += size
+		}
+		index += size
+	}
+	return string(printed[:position]), true
+}
+
+// terminal_sequence is the byte length of the character at `index` and whether
+// a terminal would act on it rather than print it.
+@(private)
+terminal_sequence :: proc(text: string, index: int) -> (size: int, unsafe: bool) {
+	byte := text[index]
+	switch {
+	case byte == '	' || byte == '\n':
+		return 1, false
+	case byte == '\r':
+		return 1, !(index + 1 < len(text) && text[index + 1] == '\n')
+	case byte < 0x20 || byte == 0x7F:
+		return 1, true
+	case byte < 0x80:
+		return 1, false
+	}
+	character, rune_size := utf8.decode_rune_in_string(text[index:])
+	if rune_size <= 0 {
+		return 1, true
+	}
+	// The C1 block (U+0080–U+009F) is the only two-byte sequence with a 0xC2
+	// lead byte; U+009B is a CSI to a terminal that reads 8-bit controls.
+	if byte == 0xC2 && character >= 0x80 && character <= 0x9F {
+		return 2, true
+	}
+	if character == utf8.RUNE_ERROR && rune_size == 1 {
+		return 1, true // not valid UTF-8: never hand the raw byte to a terminal
+	}
+	return rune_size, false
+}
+
+// sanitize_terminal_bytes is sanitize_terminal_text for the session's own raw
+// writes: the body of a `--download` that goes to stdout never passes through
+// the renderer, and a terminal is no better a place for a reply's control bytes
+// for that. `owned` means the caller frees the result with the same allocator.
+sanitize_terminal_bytes :: proc(bytes: []byte, allocator: mem.Allocator) -> (printed: []byte, owned: bool) {
+	text, allocated := sanitize_terminal_text(string(bytes), allocator)
+	if !allocated {
+		return bytes, false
+	}
+	return transmute([]byte)text, true
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
 
 // write_str writes a string and drops the byte count (core:io returns one).
 @(private)

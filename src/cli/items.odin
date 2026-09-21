@@ -156,9 +156,9 @@ Item_Set :: struct {
 // the request type's own default in place (docs/PARITY.md §3.1).
 //
 // The returned string is owned by the caller.
-item_set_body_file_content_type :: proc(set: ^Item_Set, allocator: mem.Allocator) -> string {
+item_set_body_file_content_type :: proc(set: ^Item_Set, allocator: mem.Allocator) -> (mime: string, ok: bool) {
 	if !set.body_file_given {
-		return ""
+		return "", true
 	}
 	return guess_content_type(set.body_file, allocator)
 }
@@ -409,7 +409,7 @@ split_point :: proc(arg: string, allocator: mem.Allocator) -> (offset: int, sep:
 // `split_point`'s scan is the same rule over the same bytes; a change to one
 // of the two is a change to both (t_7dce3f8a).
 @(private)
-unescape :: proc(s: string, allocator: mem.Allocator) -> string {
+unescape :: proc(s: string, allocator: mem.Allocator) -> (text: string, ok: bool) {
 	escaped := make([dynamic]bool, 0, len(s), allocator)
 	clean := make([dynamic]u8, 0, len(s), allocator)
 	defer {
@@ -439,7 +439,10 @@ unescape :: proc(s: string, allocator: mem.Allocator) -> string {
 		append(&clean, c)
 		i += 1
 	}
-	return strings.clone(string(clean[:]), allocator) or_else ""
+	// The copy is the last step, and its failure is reported by the caller:
+	// an empty key or value is a legitimate item, so an absorbed allocation
+	// error would build a wrong request (backlog M5).
+	return http.clone_or_oom(string(clean[:]), allocator)
 }
 
 // ---------------------------------------------------------------------------
@@ -470,15 +473,23 @@ parse_item_arg :: proc(arg: string, allocator: mem.Allocator) -> (item: Item_Par
 		defer delete(repr, allocator)
 		return {}, fmt.aprintf("%s is not a valid value", repr, allocator = allocator)
 	}
-	unescaped := unescape(arg, allocator)
+	unescaped, unescape_ok := unescape(arg, allocator)
+	if !unescape_ok {
+		return {}, strings.clone("not enough memory", allocator) or_else ""
+	}
 	defer delete(unescaped, allocator)
 	sep_len := len(sep_text(sep))
-	return Item_Parse {
-		key = strings.clone(unescaped[:offset], allocator) or_else "",
-		value = strings.clone(unescaped[offset + sep_len:], allocator) or_else "",
-		sep = sep,
-		orig = strings.clone(arg, allocator) or_else "",
-	}, ""
+	// Every field is an owned copy, and a copy that could not be made is
+	// reported: an empty key or value is a legitimate item, so absorbing the
+	// failure would send a wrong one (backlog M5).
+	item.sep = sep
+	if !http.clone_into(&item.key, unescaped[:offset], allocator) ||
+	   !http.clone_into(&item.value, unescaped[offset + sep_len:], allocator) ||
+	   !http.clone_into(&item.orig, arg, allocator) {
+		item_parse_destroy(&item, allocator)
+		return {}, strings.clone("not enough memory", allocator) or_else ""
+	}
+	return item, ""
 }
 
 // item_set_add parses one argument and folds it into the set. `is_json` is
@@ -508,11 +519,16 @@ item_set_add :: proc(
 		if unset {
 			value = ""
 		}
-		append(&set.headers, Header_Item {
-			name  = strings.clone(item.key, allocator) or_else "",
-			value = strings.clone(value, allocator) or_else "",
-			unset = unset,
-		})
+		header := Header_Item{unset = unset}
+		if !http.clone_into(&header.name, item.key, allocator) ||
+		   !http.clone_into(&header.value, value, allocator) {
+			// The copy that was made is released here, so the failure leaks
+			// nothing on its way out (backlog M5).
+			delete(header.name, allocator)
+			delete(header.value, allocator)
+			return strings.clone("not enough memory", allocator) or_else ""
+		}
+		append(&set.headers, header)
 	case .Header_Empty:
 		if item.value != "" {
 			repr := python_repr(item.orig, allocator)
@@ -523,35 +539,52 @@ item_set_add :: proc(
 				allocator = allocator,
 			)
 		}
-		append(&set.headers, Header_Item {
-			name  = strings.clone(item.key, allocator) or_else "",
-			value = "",
-		})
+		header := Header_Item{}
+		if !http.clone_into(&header.name, item.key, allocator) {
+			return strings.clone("not enough memory", allocator) or_else ""
+		}
+		append(&set.headers, header)
 	case .Header_Embed:
 		contents, file_message := read_text_file(item.value, item.orig, env, allocator)
 		if file_message != "" {
 			return file_message
 		}
-		append(&set.headers, Header_Item {
-			name  = strings.clone(item.key, allocator) or_else "",
-			value = rstrip_newlines(contents, allocator),
-		})
+		header_value, value_ok := rstrip_newlines(contents, allocator)
 		delete(contents, allocator)
+		if !value_ok {
+			return strings.clone("not enough memory", allocator) or_else ""
+		}
+		header := Header_Item{value = header_value}
+		if !http.clone_into(&header.name, item.key, allocator) {
+			delete(header.value, allocator)
+			return strings.clone("not enough memory", allocator) or_else ""
+		}
+		append(&set.headers, header)
 	case .Query_Param:
-		append(&set.params, Param_Item {
-			name  = strings.clone(item.key, allocator) or_else "",
-			value = strings.clone(item.value, allocator) or_else "",
-		})
+		param := Param_Item{}
+		if !http.clone_into(&param.name, item.key, allocator) ||
+		   !http.clone_into(&param.value, item.value, allocator) {
+			delete(param.name, allocator)
+			delete(param.value, allocator)
+			return strings.clone("not enough memory", allocator) or_else ""
+		}
+		append(&set.params, param)
 	case .Query_Embed:
 		contents, file_message := read_text_file(item.value, item.orig, env, allocator)
 		if file_message != "" {
 			return file_message
 		}
-		append(&set.params, Param_Item {
-			name  = strings.clone(item.key, allocator) or_else "",
-			value = rstrip_newlines(contents, allocator),
-		})
+		param_value, value_ok := rstrip_newlines(contents, allocator)
 		delete(contents, allocator)
+		if !value_ok {
+			return strings.clone("not enough memory", allocator) or_else ""
+		}
+		param := Param_Item{value = param_value}
+		if !http.clone_into(&param.name, item.key, allocator) {
+			delete(param.value, allocator)
+			return strings.clone("not enough memory", allocator) or_else ""
+		}
+		append(&set.params, param)
 	case .File_Upload:
 		// A `@file` item is a *file field*, with or without a key: the reference
 		// reads every one of them through process_file_upload_arg, where the
@@ -571,9 +604,11 @@ item_set_add :: proc(
 			if file_message != "" {
 				return file_message
 			}
-			delete(set.body_file, allocator)
 			delete(set.body_file_contents, allocator)
-			set.body_file = strings.clone(path, allocator) or_else ""
+			if !http.clone_into(&set.body_file, path, allocator) {
+				delete(contents, allocator)
+				return strings.clone("not enough memory", allocator) or_else ""
+			}
 			set.body_file_contents = contents
 			set.body_file_given = true
 		} else {
@@ -600,7 +635,11 @@ item_set_add :: proc(
 		value: format.Value
 		#partial switch item.sep {
 		case .Data_String:
-			value = strings.clone(item.value, allocator) or_else ""
+			cloned, clone_ok := http.clone_or_oom(item.value, allocator)
+			if !clone_ok {
+				return strings.clone("not enough memory", allocator) or_else ""
+			}
+			value = cloned
 		case .Data_Embed_File:
 			contents, file_message := read_text_file(item.value, item.orig, env, allocator)
 			if file_message != "" {
@@ -693,13 +732,30 @@ item_set_add :: proc(
 				format.value_destroy(&value, allocator)
 				return strings.clone(COMPLEX_JSON_IN_FORM_MESSAGE, allocator) or_else ""
 			}
-			// Primitives are stringified the way Python prints them.
-			value = format.value_to_form_string(value, allocator)
+			// Primitives are stringified the way Python prints them. The copy
+			// inside that answer is reported: an empty form value is a legitimate
+			// part, so absorbing it would send the wrong body (backlog M5).
+			converted, converted_ok := format.value_to_form_string(value, allocator)
+			if !converted_ok {
+				format.value_destroy(&value, allocator)
+				return strings.clone("not enough memory", allocator) or_else ""
+			}
+			value = converted
 		}
 
+		data_key, data_orig: string
+		if !http.clone_into(&data_key, item.key, allocator) ||
+		   !http.clone_into(&data_orig, item.orig, allocator) {
+			// The parsed value travels with the item, so the failure has to
+			// release it as well as the copies already made (backlog M5).
+			delete(data_key, allocator)
+			delete(data_orig, allocator)
+			format.value_destroy(&value, allocator)
+			return strings.clone("not enough memory", allocator) or_else ""
+		}
 		append(&set.data, Data_Item {
-			key   = strings.clone(item.key, allocator) or_else "",
-			orig  = strings.clone(item.orig, allocator) or_else "",
+			key   = data_key,
+			orig  = data_orig,
 			sep   = item.sep,
 			value = value,
 		})
@@ -753,21 +809,48 @@ load_upload :: proc(
 	message: string,
 ) {
 	path, mime := split_file_upload_arg(raw_value)
-	expanded := expand_user_path(path, env, allocator)
+	expanded, expanded_ok := expand_user_path(path, env, allocator)
+	if !expanded_ok {
+		return {}, strings.clone("not enough memory", allocator) or_else ""
+	}
 	defer delete(expanded, allocator)
 	contents, file_message := read_file_bytes(expanded, orig, allocator)
 	if file_message != "" {
 		return {}, file_message
 	}
-	return File_Item {
-		name = strings.clone(name, allocator) or_else "",
-		// The basename of the *unexpanded* name: `os.path.basename(filename)`,
-		// so the part's filename-parameter is what the command line spelled.
-		filename = strings.clone(base_name(path), allocator) or_else "",
-		path = strings.clone(expanded, allocator) or_else "",
-		mime = mime != "" ? strings.clone(mime, allocator) or_else "" : guess_content_type(path, allocator),
-		content = contents,
-	}, ""
+	// `mime_type or get_content_type(filename)`: the `;type=` override wins,
+	// and a guess whose copy failed is reported rather than sent as a field
+	// with no type (backlog M5).
+	mime_value := mime
+	guessed := ""
+	if mime_value == "" {
+		guess, guess_ok := guess_content_type(path, allocator)
+		if !guess_ok {
+			delete(contents, allocator)
+			return {}, strings.clone("not enough memory", allocator) or_else ""
+		}
+		guessed, mime_value = guess, guess
+	}
+	owned := http.clone_into(&file.name, name, allocator) &&
+	         // The basename of the *unexpanded* name: `os.path.basename(filename)`,
+	         // so the part's filename-parameter is what the command line spelled.
+	         http.clone_into(&file.filename, base_name(path), allocator) &&
+	         http.clone_into(&file.path, expanded, allocator) &&
+	         http.clone_into(&file.mime, mime_value, allocator)
+	if !owned {
+		// What was copied before the failure is released here, together with
+		// the guess and the bytes the item would have carried (backlog M5).
+		delete(file.name, allocator)
+		delete(file.filename, allocator)
+		delete(file.path, allocator)
+		delete(file.mime, allocator)
+		delete(guessed, allocator)
+		delete(contents, allocator)
+		return {}, strings.clone("not enough memory", allocator) or_else ""
+	}
+	delete(guessed, allocator)
+	file.content = contents
+	return file, ""
 }
 
 // expand_user_path is `os.path.expanduser` for the paths a file item names
@@ -777,9 +860,9 @@ load_upload :: proc(
 // (docs/ARCHITECTURE.md: only the transport talks to C), and the remainder is
 // recorded in docs/PARITY.md §8.18. The result is owned by the caller.
 @(private)
-expand_user_path :: proc(name: string, env: Env_Info, allocator: mem.Allocator) -> string {
+expand_user_path :: proc(name: string, env: Env_Info, allocator: mem.Allocator) -> (path: string, ok: bool) {
 	if !strings.has_prefix(name, "~") {
-		return strings.clone(name, allocator) or_else ""
+		return http.clone_or_oom(name, allocator)
 	}
 	end := strings.index_byte(name, '/')
 	if end < 0 {
@@ -795,15 +878,20 @@ expand_user_path :: proc(name: string, env: Env_Info, allocator: mem.Allocator) 
 		have_home = false
 	}
 	if !have_home {
-		return strings.clone(name, allocator) or_else ""
+		return http.clone_or_oom(name, allocator)
 	}
 	// `userhome = userhome.rstrip('/')`, then the path is glued back on; an
-	// empty result is '/'.
-	joined := strings.concatenate({strings.trim_right(home, "/"), name[end:]}, allocator) or_else ""
-	if joined == "" {
-		return strings.clone("/", allocator) or_else ""
+	// empty result is '/'. Both the join and the copy are reported rather
+	// than read as the empty path, which is a path the reference never
+	// produces (backlog M5).
+	joined, join_err := strings.concatenate({strings.trim_right(home, "/"), name[end:]}, allocator)
+	if join_err != .None {
+		return "", false
 	}
-	return joined
+	if joined == "" {
+		return http.clone_or_oom("/", allocator)
+	}
+	return joined, true
 }
 
 base_name :: proc(path: string) -> string {
@@ -823,30 +911,34 @@ base_name :: proc(path: string) -> string {
 // outside it guesses nothing, exactly as the reference's `None` does — there is
 // no octet-stream fallback anywhere in the reference. The returned string is
 // owned by the caller and is "" when the extension says nothing.
-guess_content_type :: proc(path: string, allocator: mem.Allocator) -> string {
+guess_content_type :: proc(path: string, allocator: mem.Allocator) -> (mime: string, ok: bool) {
 	lower := strings.to_lower(path, allocator)
 	defer delete(lower, allocator)
+	// Every entry of the table is a copy whose failure the caller reports:
+	// an empty type means "the extension says nothing" to httpie, so the
+	// absorbed error would send the file untyped (backlog M5). The last
+	// return is that empty answer itself, with nothing to build.
 	switch {
 	case strings.has_suffix(lower, ".txt"):
-		return strings.clone("text/plain", allocator) or_else ""
+		return http.clone_or_oom("text/plain", allocator)
 	case strings.has_suffix(lower, ".json"):
-		return strings.clone("application/json", allocator) or_else ""
+		return http.clone_or_oom("application/json", allocator)
 	case strings.has_suffix(lower, ".html"), strings.has_suffix(lower, ".htm"):
-		return strings.clone("text/html", allocator) or_else ""
+		return http.clone_or_oom("text/html", allocator)
 	case strings.has_suffix(lower, ".xml"):
-		return strings.clone("application/xml", allocator) or_else ""
+		return http.clone_or_oom("application/xml", allocator)
 	case strings.has_suffix(lower, ".png"):
-		return strings.clone("image/png", allocator) or_else ""
+		return http.clone_or_oom("image/png", allocator)
 	case strings.has_suffix(lower, ".jpg"), strings.has_suffix(lower, ".jpeg"):
-		return strings.clone("image/jpeg", allocator) or_else ""
+		return http.clone_or_oom("image/jpeg", allocator)
 	case strings.has_suffix(lower, ".gif"):
-		return strings.clone("image/gif", allocator) or_else ""
+		return http.clone_or_oom("image/gif", allocator)
 	case strings.has_suffix(lower, ".pdf"):
-		return strings.clone("application/pdf", allocator) or_else ""
+		return http.clone_or_oom("application/pdf", allocator)
 	case strings.has_suffix(lower, ".bin"):
-		return strings.clone("application/octet-stream", allocator) or_else ""
+		return http.clone_or_oom("application/octet-stream", allocator)
 	}
-	return ""
+	return "", true
 }
 
 // ---------------------------------------------------------------------------
@@ -882,7 +974,10 @@ read_text_file :: proc(
 	contents: string,
 	message: string,
 ) {
-	expanded := expand_user_path(path, env, allocator)
+	expanded, expanded_ok := expand_user_path(path, env, allocator)
+	if !expanded_ok {
+		return "", strings.clone("not enough memory", allocator) or_else ""
+	}
 	defer delete(expanded, allocator)
 	data, file_message := read_file_bytes(expanded, orig, allocator)
 	if file_message != "" {
@@ -912,7 +1007,10 @@ read_binary_file :: proc(
 	contents: []byte,
 	message: string,
 ) {
-	expanded := expand_user_path(path, env, allocator)
+	expanded, expanded_ok := expand_user_path(path, env, allocator)
+	if !expanded_ok {
+		return nil, strings.clone("not enough memory", allocator) or_else ""
+	}
 	defer delete(expanded, allocator)
 	return read_file_bytes(expanded, orig, allocator)
 }
@@ -966,12 +1064,14 @@ cannot_embed_message :: proc(orig, value: string, allocator: mem.Allocator) -> s
 }
 
 @(private)
-rstrip_newlines :: proc(s: string, allocator: mem.Allocator) -> string {
+rstrip_newlines :: proc(s: string, allocator: mem.Allocator) -> (text: string, ok: bool) {
 	end := len(s)
 	for end > 0 && s[end - 1] == '\n' {
 		end -= 1
 	}
-	return strings.clone(s[:end], allocator) or_else ""
+	// The callers (the `:@`/`==@` arms of item_set_add) report the failure:
+	// an empty header or query value is a legitimate item (backlog M5).
+	return http.clone_or_oom(s[:end], allocator)
 }
 
 // python_repr renders a string the way Python's repr() renders it, which is
@@ -1189,18 +1289,26 @@ empty_for :: proc(action: Path_Action) -> format.Value {
 	return format.Null{}
 }
 
+// M5 KEEP (this proc, clone_member, object_child and object_set below): every
+// one of them *builds* a `format.Value` — they answer a value, not a status —
+// and the copies they make are read back by the nested-path drill, which is
+// called from the `:=` item path and recursively from here. Reporting a failed
+// copy means giving the whole drill a failure channel (clone_value →
+// clone_member → object_set/array_set → apply_nested_json); that is this
+// sweep's recorded residual in docs/rating/HTThor-remediation-backlog.md rather
+// than a half-threaded bool. Each site says so in one line.
 @(private)
 clone_value :: proc(v: ^format.Value, allocator: mem.Allocator) -> format.Value {
 	#partial switch value in v^ {
 	case string:
-		return strings.clone(value, allocator) or_else ""
+		return strings.clone(value, allocator) or_else "" // M5 keep: see above.
 	case format.Surrogate_String:
 		// The marks are owned like the text: a clone that shared them would be
 		// freed twice, so both halves are copied.
 		marks := make([]format.Surrogate_Mark, len(value.marks), allocator)
 		copy(marks, value.marks)
 		return format.Surrogate_String {
-			text  = strings.clone(value.text, allocator) or_else "",
+			text  = strings.clone(value.text, allocator) or_else "", // M5 keep: see above.
 			marks = marks,
 		}
 	case format.Object:
@@ -1237,7 +1345,7 @@ clone_member :: proc(member: ^format.Member, allocator: mem.Allocator) -> format
 	key_marks := make([]format.Surrogate_Mark, len(member.key_marks), allocator)
 	copy(key_marks, member.key_marks)
 	return format.Member {
-		key       = strings.clone(member.key, allocator) or_else "",
+		key       = strings.clone(member.key, allocator) or_else "", // M5 keep: see clone_value.
 		key_marks = key_marks,
 		value     = clone_value(&member.value, allocator),
 	}
@@ -1260,7 +1368,7 @@ object_child :: proc(root: ^format.Value, key: string, next: Path_Action, alloca
 		members[i] = object.members[i]
 	}
 	members[len(object.members)] = format.Member {
-		key   = strings.clone(key, allocator) or_else "",
+		key   = strings.clone(key, allocator) or_else "", // M5 keep: see clone_value.
 		value = empty_for(next),
 	}
 	delete(object.members, allocator)
@@ -1284,7 +1392,7 @@ object_set :: proc(root: ^format.Value, key: string, value: format.Value, alloca
 		members[i] = object.members[i]
 	}
 	members[len(object.members)] = format.Member {
-		key   = strings.clone(key, allocator) or_else "",
+		key   = strings.clone(key, allocator) or_else "", // M5 keep: see clone_value.
 		value = value,
 	}
 	delete(object.members, allocator)
@@ -1365,9 +1473,13 @@ parse_nested_path :: proc(key: string, allocator: mem.Allocator) -> (paths: []Pa
 		i += 1
 	}
 	if i > root_start {
+		accessor, accessor_ok := unescape_key(key[root_start:i], allocator)
+		if !accessor_ok {
+			return nil, nested_path_oom(&result, allocator)
+		}
 		append(&result, Path {
 			action   = .Key,
-			accessor = unescape_key(key[root_start:i], allocator),
+			accessor = accessor,
 			start    = root_start,
 			end      = i,
 		})
@@ -1386,18 +1498,24 @@ parse_nested_path :: proc(key: string, allocator: mem.Allocator) -> (paths: []Pa
 		if inner == "" {
 			append(&result, Path{action = .Append, start = open, end = i})
 		} else {
+			accessor, accessor_ok := http.clone_or_oom(inner, allocator)
+			if !accessor_ok {
+				return nil, nested_path_oom(&result, allocator)
+			}
 			append(&result, Path {
 				action   = .Index,
-				accessor = strings.clone(inner, allocator) or_else "",
+				accessor = accessor,
 				start    = open,
 				end      = i,
 			})
 		}
 	} else {
 		// An empty root (e.g. `[0]=x`): httpie yields an empty TEXT root path.
+		// Its accessor is the empty string itself rather than a copy of it:
+		// there is nothing to allocate, so nothing that could fail (backlog M5).
 		append(&result, Path {
 			action   = .Key,
-			accessor = strings.clone("", allocator) or_else "",
+			accessor = "",
 			start    = 0,
 			end      = 0,
 		})
@@ -1422,16 +1540,24 @@ parse_nested_path :: proc(key: string, allocator: mem.Allocator) -> (paths: []Pa
 		if inner == "" {
 			append(&result, Path{action = .Append, start = open, end = i})
 		} else if _, is_number := strconv.parse_int(inner); is_number {
+			accessor, accessor_ok := http.clone_or_oom(inner, allocator)
+			if !accessor_ok {
+				return nil, nested_path_oom(&result, allocator)
+			}
 			append(&result, Path {
 				action   = .Index,
-				accessor = strings.clone(inner, allocator) or_else "",
+				accessor = accessor,
 				start    = open,
 				end      = i,
 			})
 		} else {
+			accessor, accessor_ok := unescape_key(inner, allocator)
+			if !accessor_ok {
+				return nil, nested_path_oom(&result, allocator)
+			}
 			append(&result, Path {
 				action   = .Key,
-				accessor = unescape_key(inner, allocator),
+				accessor = accessor,
 				start    = open,
 				end      = i,
 			})
@@ -1440,10 +1566,26 @@ parse_nested_path :: proc(key: string, allocator: mem.Allocator) -> (paths: []Pa
 	return result[:], ""
 }
 
+// nested_path_oom reports a copy that could not be made while a nested key was
+// being tokenised: the paths built so far are released here (the success path
+// hands them to the caller, which frees them), and the message is the parser's
+// own out-of-memory wording -- empty only if that copy fails too (backlog M5).
 @(private)
-unescape_key :: proc(s: string, allocator: mem.Allocator) -> string {
+nested_path_oom :: proc(result: ^[dynamic]Path, allocator: mem.Allocator) -> string {
+	for path in result^ {
+		delete(path.accessor, allocator)
+	}
+	delete(result^)
+	return strings.clone("not enough memory", allocator) or_else ""
+}
+
+// unescape_key is the bracket-path reader's own backslash rule (httpie's
+// nested_json `_unescape`); the copy it makes is reported, because an empty
+// accessor is a legitimate key (backlog M5).
+@(private)
+unescape_key :: proc(s: string, allocator: mem.Allocator) -> (text: string, ok: bool) {
 	if !strings.contains(s, "\\") {
-		return strings.clone(s, allocator) or_else ""
+		return http.clone_or_oom(s, allocator)
 	}
 	builder := strings.builder_make(allocator)
 	for i := 0; i < len(s); i += 1 {
@@ -1455,7 +1597,13 @@ unescape_key :: proc(s: string, allocator: mem.Allocator) -> string {
 		}
 		strings.write_byte(&builder, s[i])
 	}
-	return strings.to_string(builder)
+	text = strings.to_string(builder)
+	if text == "" {
+		// A key that carries a backslash writes at least one byte, so an
+		// empty answer is the allocation that failed (backlog M5).
+		return "", false
+	}
+	return text, true
 }
 
 // syntax_error_text renders the `HTTPie Syntax Error:` block httpie prints for

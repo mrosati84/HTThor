@@ -236,7 +236,7 @@ lex_headers :: proc(text: string, variant: Lex_Variant, allocator: mem.Allocator
 	tokens := make([dynamic]Token, allocator)
 	switch variant {
 	case .Pygments_Http:
-		http_tokens(storage, &tokens)
+		http_tokens(storage, &tokens, allocator)
 	case .Simplified_Head:
 		simplified_http_tokens(storage, false, &tokens)
 	case .Simplified_Precise:
@@ -254,9 +254,9 @@ lex_json :: proc(text: string, allocator: mem.Allocator) -> Lexed {
 
 	if prefix := json_prefix_length(storage); prefix > 0 {
 		append(&tokens, Token{kind = .Error, text = storage[:prefix]})
-		json_tokens(storage[prefix:], &tokens)
+		json_tokens(storage[prefix:], &tokens, allocator)
 	} else {
-		json_tokens(storage, &tokens)
+		json_tokens(storage, &tokens, allocator)
 	}
 	return Lexed{storage = storage, tokens = tokens}
 }
@@ -912,11 +912,16 @@ json_emit_or_queue :: proc(
 // are preserved one-to-one; the only translation is that Python iterates
 // *characters* while Odin slices *bytes*, so a rune -> byte offset table is
 // built up front.
+//
+// The three scratch buffers take `allocator` explicitly: they are the only
+// allocations in this file that are not a token array, and main.odin's rule
+// (README.md, "Memory ownership") is that every site names its allocator
+// instead of reaching for the implicit context one.
 @(private)
-json_tokens :: proc(text: string, tokens: ^[dynamic]Token) {
-	offsets := make([dynamic]int, 0, len(text) + 1)
+json_tokens :: proc(text: string, tokens: ^[dynamic]Token, allocator: mem.Allocator) {
+	offsets := make([dynamic]int, 0, len(text) + 1, allocator)
 	defer delete(offsets)
-	runes := make([dynamic]rune, 0, len(text))
+	runes := make([dynamic]rune, 0, len(text), allocator)
 	defer delete(runes)
 
 	for i := 0; i < len(text); {
@@ -944,7 +949,7 @@ json_tokens :: proc(text: string, tokens: ^[dynamic]Token) {
 	expecting_second_comment_closer := false
 
 	start := 0
-	queue := make([dynamic]JSON_Queued, 0, 8)
+	queue := make([dynamic]JSON_Queued, 0, 8, allocator)
 	defer delete(queue)
 
 	for stop := 0; stop < len(runes); stop += 1 {
@@ -1420,7 +1425,7 @@ http_match_continuation :: proc(text: string, pos: int, m: ^HTTP_Match) -> bool 
 // (textfmts.py:52-75): only the JSON mime types pygments resolves to JsonLexer
 // are recognised here.
 @(private)
-http_tokens :: proc(text: string, tokens: ^[dynamic]Token) {
+http_tokens :: proc(text: string, tokens: ^[dynamic]Token, allocator: mem.Allocator) {
 	HTTP_State :: enum {
 		Root,
 		Headers,
@@ -1501,7 +1506,7 @@ http_tokens :: proc(text: string, tokens: ^[dynamic]Token) {
 			// ('.+', content_callback) -- DOTALL, so it eats the whole rest.
 			content := text[pos:]
 			if content != "" {
-				http_content_tokens(content, content_type, tokens)
+				http_content_tokens(content, content_type, tokens, allocator)
 				pos = len(text)
 				continue
 			}
@@ -1529,13 +1534,18 @@ http_tokens :: proc(text: string, tokens: ^[dynamic]Token) {
 // body after the blank line is re-lexed with the lexer pygments resolves for
 // the Content-Type the head declared, or emitted as plain Text.
 @(private)
-http_content_tokens :: proc(content: string, content_type: string, tokens: ^[dynamic]Token) {
+http_content_tokens :: proc(
+	content: string,
+	content_type: string,
+	tokens: ^[dynamic]Token,
+	allocator: mem.Allocator,
+) {
 	if content_type != "" {
 		for mime in JSON_LEXER_MIMETYPES {
 			if content_type == mime {
 				// get_lexer_for_mimetype resolves application/json to
 				// pygments' JsonLexer, *not* to httpie's EnhancedJsonLexer.
-				json_tokens(content, tokens)
+				json_tokens(content, tokens, allocator)
 				return
 			}
 		}

@@ -61,6 +61,7 @@ test_option_constants_match_libcurl :: proc(t: ^testing.T) {
 	check_option(t, "CUSTOMREQUEST", http.CURLOPT_CUSTOMREQUEST)
 	check_option(t, "CAINFO", http.CURLOPT_CAINFO)
 	check_option(t, "SSL_CIPHER_LIST", http.CURLOPT_SSL_CIPHER_LIST)
+	check_option(t, "SSLVERSION", http.CURLOPT_SSLVERSION)
 	check_option(t, "KEYPASSWD", http.CURLOPT_KEYPASSWD)
 	check_option(t, "SSLKEY", http.CURLOPT_SSLKEY)
 	check_option(t, "ACCEPT_ENCODING", http.CURLOPT_ACCEPT_ENCODING)
@@ -104,6 +105,7 @@ test_easy_handle_accepts_every_option_the_engine_sets :: proc(t: ^testing.T) {
 		{"SSL_VERIFYHOST", http.setopt_long(handle, http.CURLOPT_SSL_VERIFYHOST, 2)},
 		{"ACCEPT_ENCODING", http.setopt_string(handle, http.CURLOPT_ACCEPT_ENCODING, "")},
 		{"NOSIGNAL", http.setopt_long(handle, http.CURLOPT_NOSIGNAL, 1)},
+		{"SSLVERSION", http.setopt_long(handle, http.CURLOPT_SSLVERSION, http.CURL_SSLVERSION_TLSv1_2)},
 		{"NOBODY", http.setopt_long(handle, http.CURLOPT_NOBODY, 0)},
 	}
 	for check in checks {

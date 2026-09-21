@@ -262,6 +262,9 @@ cookie_domain_ok :: proc(cookie: ^Cookie, host: string) -> bool {
 	if host_lower == domain {
 		return true
 	}
+	// M5 keep: the hook has no failure channel (see the note above); a suffix
+	// that could not be built answers "the host does not match", which drops the
+	// cookie rather than sending it to the wrong host.
 	suffix := strings.concatenate({".", domain}, context.temp_allocator) or_else ""
 	return suffix != "" && strings.has_suffix(host_lower, suffix)
 }
@@ -287,6 +290,12 @@ cookie_path_ok :: proc(path: string, request_path: string) -> bool {
 
 // is_local_host is HTTPieCookiePolicy's Firefox-inspired localhost rule: a
 // secure cookie is still sent to `localhost` over plain http.
+//
+// M5 KEEP (this group: cookie_domain_ok, lowercased and split_semicolons below):
+// these three live behind the transport's cookie hook, whose `value` answers the
+// `Cookie` header as a plain string (`http.Cookie_Hook.value`) — there is no
+// failure channel to report a copy through, so the `or_else` forms stay and each
+// site says so. The hook is the transport's, not the session's, to widen.
 @(private)
 is_local_host :: proc(host: string) -> bool {
 	lower := lowercased(host)
@@ -294,7 +303,12 @@ is_local_host :: proc(host: string) -> bool {
 }
 
 // lowercased is `str.lower()`; without an upper-case byte it borrows `text`,
-// which is what the callers above want.
+// which is what the callers above want. M5 keep: the fallback is the input
+// itself — a `str.lower()` that could not be allocated answers the original
+// spelling, which is a case-insensitive comparison the callers'
+// `equal_fold`/`has_suffix` still gets right for the ASCII hosts a cookie is
+// scoped to, and it is on the hook's string-only path, where nothing could
+// report it anyway.
 @(private)
 lowercased :: proc(text: string) -> string {
 	for index in 0 ..< len(text) {
@@ -313,6 +327,14 @@ lowercased :: proc(text: string) -> string {
 // a reply that arrived at `host`/`request_path` (RFC 6265 §5.2 + §5.3).
 // `usable` is false for a cookie the reply expired, which the caller turns into
 // a deletion.
+//
+// M5 KEEP (every `or_else` below): the pair (Cookie, usable) has no room for a
+// third state — `usable = false` means "expired, delete the stored cookie,"
+// while a copy failure must not delete anything — and the reply's whole path
+// (session_collect_cookies → collect_response_cookies → session_store_set_cookie
+// → here) answers void. A copy that could not be made therefore lands as an
+// empty field of an otherwise stored cookie; that residual of this sweep is
+// recorded in docs/rating/HTThor-remediation-backlog.md.
 @(private)
 cookie_from_set_cookie :: proc(
 	text: string,
@@ -324,14 +346,14 @@ cookie_from_set_cookie :: proc(
 	cookie: Cookie,
 	usable: bool,
 ) {
-	cookie.path = strings.clone("/", allocator) or_else ""
-	cookie.domain = strings.clone(lowercased(host), allocator) or_else ""
+	cookie.path = strings.clone("/", allocator) or_else "" // M5 keep: see the note above.
+	cookie.domain = strings.clone(lowercased(host), allocator) or_else "" // M5 keep.
 	usable = true
 
 	pair, attributes := split_once(text, ";")
 	name, value := split_once(pair, "=")
-	cookie.name = strings.clone(strings.trim_space(name), allocator) or_else ""
-	cookie.value = strings.clone(unquoted(strings.trim_space(value)), allocator) or_else ""
+	cookie.name = strings.clone(strings.trim_space(name), allocator) or_else "" // M5 keep.
+	cookie.value = strings.clone(unquoted(strings.trim_space(value)), allocator) or_else "" // M5 keep.
 
 	path_attribute := ""
 	domain_attribute := ""
@@ -366,15 +388,15 @@ cookie_from_set_cookie :: proc(
 
 	if domain_attribute != "" {
 		delete(cookie.domain, allocator)
-		cookie.domain = strings.clone(lowercased(domain_attribute), allocator) or_else ""
+		cookie.domain = strings.clone(lowercased(domain_attribute), allocator) or_else "" // M5 keep.
 		cookie.domain_specified = true
 	}
 	if path_attribute != "" {
 		delete(cookie.path, allocator)
-		cookie.path = strings.clone(path_attribute, allocator) or_else ""
+		cookie.path = strings.clone(path_attribute, allocator) or_else "" // M5 keep.
 	} else {
 		delete(cookie.path, allocator)
-		cookie.path = strings.clone(default_cookie_path(request_path), allocator) or_else "/"
+		cookie.path = strings.clone(default_cookie_path(request_path), allocator) or_else "/" // M5 keep.
 	}
 
 	// A Max-Age overrides Expires (RFC 6265 §5.3 step 3).
@@ -422,6 +444,9 @@ split_once :: proc(text: string, separator: string) -> (head: string, tail: stri
 // split_semicolons splits a Set-Cookie attribute list on `;`.
 @(private)
 split_semicolons :: proc(text: string) -> []string {
+	// M5 keep: the hook's string-only path again (see the note at
+	// cookie_domain_ok); a split that could not be made answers "no attributes",
+	// so the Set-Cookie line is read as a bare `name=value`.
 	parts := strings.split(text, ";", context.temp_allocator) or_else nil
 	return parts
 }
@@ -582,6 +607,20 @@ days_from_civil :: proc(year, month, day: i64) -> i64 {
 // httpie parses it with `http.cookies.SimpleCookie`, so it is a list of
 // `name=value` pairs, with any `Path`/`Domain` attribute applying to the pair
 // it follows.
+//
+// KEEP-OR-DROP DECISION (backlog M6): this proc has no caller yet. The filter that
+// would use it runs — `session_stores_header` drops a request's `Cookie`
+// header because "its cookies go into the jar instead" (store.odin) — but the
+// move itself is not wired, so the cookies of a `Cookie:` request header are
+// currently dropped rather than jarred. That is a behavioural change to
+// `session_record_headers`, not dead-code removal, so it is deliberately left
+// here (with this note) instead of being deleted: it is the only
+// implementation of the reference branch, and deleting it would hide the gap
+// rather than record it.
+//
+// M5 KEEP (every `or_else` in this proc): it has no caller at all (see the
+// KEEP-OR-DROP DECISION above), so there is no channel of any kind to report a
+// copy through until the move it implements is wired.
 @(private)
 session_store_request_cookies :: proc(session: ^Session, text: string, host: string) {
 	allocator := session.allocator
@@ -599,13 +638,13 @@ session_store_request_cookies :: proc(session: ^Session, text: string, host: str
 		case strings.equal_fold(key, "path"):
 			if current != nil {
 				delete(current.path, allocator)
-				current.path = strings.clone(value != "" ? value : "/", allocator) or_else "/"
+				current.path = strings.clone(value != "" ? value : "/", allocator) or_else "/" // M5 keep.
 			}
 			continue
 		case strings.equal_fold(key, "domain"):
 			if current != nil {
 				delete(current.domain, allocator)
-				current.domain = strings.clone(lowercased(value), allocator) or_else ""
+				current.domain = strings.clone(lowercased(value), allocator) or_else "" // M5 keep.
 				current.domain_specified = current.domain != ""
 			}
 			continue
@@ -624,10 +663,10 @@ session_store_request_cookies :: proc(session: ^Session, text: string, host: str
 			continue
 		}
 		cookie := Cookie {
-			name   = strings.clone(key, allocator) or_else "",
-			value  = strings.clone(unquoted(value), allocator) or_else "",
-			path   = strings.clone("/", allocator) or_else "",
-			domain = strings.clone(lowercased(host), allocator) or_else "",
+			name   = strings.clone(key, allocator) or_else "", // M5 keep.
+			value  = strings.clone(unquoted(value), allocator) or_else "", // M5 keep.
+			path   = strings.clone("/", allocator) or_else "", // M5 keep.
+			domain = strings.clone(lowercased(host), allocator) or_else "", // M5 keep.
 		}
 		if cookie.name == "" {
 			cookie_destroy(&cookie, allocator)

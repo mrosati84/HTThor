@@ -86,6 +86,10 @@ CURLOPTTYPE_FUNCTIONPOINT :: 20000
 // CURLOPT_* (curl 8.5.0, curl.h).
 CURLOPT_TIMEOUT :: CURLoption(13)
 CURLOPT_INFILESIZE :: CURLoption(14)
+// `--ssl`: the option is CURLOPTTYPE_LONG + 32, verified against libcurl 8.5.0
+// with curl_easy_option_by_name — the same run-time check
+// tests/libcurl_test.odin makes.
+CURLOPT_SSLVERSION :: CURLoption(32)
 CURLOPT_VERBOSE :: CURLoption(41)
 CURLOPT_NOBODY :: CURLoption(44)
 CURLOPT_UPLOAD :: CURLoption(46)
@@ -145,6 +149,14 @@ CURLAUTH_BEARER :: c.long(1 << 6)
 // would also change the status line the parser sees).
 CURL_HTTP_VERSION_1_1 :: c.long(2)
 
+// curl_sslversion (curl.h): every value below is a *floor* — the lowest
+// protocol version libcurl may negotiate — which is the meaning `--ssl` has
+// here (the older CURL_SSLVERSION_TLSv1 spells the same floor as TLSv1_0).
+CURL_SSLVERSION_DEFAULT :: c.long(0)
+CURL_SSLVERSION_TLSv1_0 :: c.long(4)
+CURL_SSLVERSION_TLSv1_1 :: c.long(5)
+CURL_SSLVERSION_TLSv1_2 :: c.long(6)
+
 // The libcurl entry points the engine needs, named exactly as in C (with
 // `@(default_calling_convention="c")` supplying the ABI). Keeping the C names
 // means a call site can be diffed against curl's own man pages.
@@ -162,13 +174,9 @@ foreign libcurl {
 	curl_easy_perform        :: proc(handle: CURL) -> CURLcode ---
 	curl_easy_strerror       :: proc(code: CURLcode) -> cstring ---
 	curl_easy_option_by_name :: proc(name: cstring) -> ^CURL_easyoption ---
-	curl_easy_escape         :: proc(handle: CURL, string: cstring, length: c.int) -> cstring ---
-	curl_easy_unescape       :: proc(handle: CURL, string: cstring, length: c.int, outlength: ^c.int) -> cstring ---
 
 	curl_slist_append        :: proc(list: ^CURL_slist, s: cstring) -> ^CURL_slist ---
 	curl_slist_free_all      :: proc(list: ^CURL_slist) ---
-
-	curl_free                :: proc(ptr: rawptr) ---
 }
 
 // setopt takes a `long` option value. The helpers below exist because

@@ -79,22 +79,26 @@ env_get :: proc(env: Env_Info, name: string) -> (string, bool) {
 }
 
 // env_info_clone copies `env` so the copy can outlive the caller's strings.
-env_info_clone :: proc(env: Env_Info, allocator: mem.Allocator) -> Env_Info {
-	cloned := Env_Info {
-		stdin_is_tty  = env.stdin_is_tty,
-		stdout_is_tty = env.stdout_is_tty,
-		stderr_is_tty = env.stderr_is_tty,
-	}
+// False is a copy that could not be made: an environment entry with an empty
+// name or value would be read as "not set" by every `env_get` below, so the
+// caller (parse_args_with) reports it instead (backlog M5).
+env_info_clone :: proc(env: Env_Info, allocator: mem.Allocator) -> (cloned: Env_Info, ok: bool) {
+	cloned.stdin_is_tty = env.stdin_is_tty
+	cloned.stdout_is_tty = env.stdout_is_tty
+	cloned.stderr_is_tty = env.stderr_is_tty
 	if len(env.vars) > 0 {
 		cloned.vars = make([]Env_Var, len(env.vars), allocator)
 		for v, i in env.vars {
-			cloned.vars[i] = Env_Var {
-				name  = strings.clone(v.name, allocator) or_else "",
-				value = strings.clone(v.value, allocator) or_else "",
+			// A copy that failed releases the entries cloned before it, so the
+			// failure leaks nothing on its way out (backlog M5).
+			if !http.clone_into(&cloned.vars[i].name, v.name, allocator) ||
+			   !http.clone_into(&cloned.vars[i].value, v.value, allocator) {
+				env_info_destroy(&cloned, allocator)
+				return {}, false
 			}
 		}
 	}
-	return cloned
+	return cloned, true
 }
 
 // env_info_destroy releases an Env_Info built by env_info_clone or
@@ -137,12 +141,18 @@ env_info_from_process :: proc(allocator: mem.Allocator) -> Env_Info {
 		env.vars = make([]Env_Var, len(raw), allocator)
 		for entry, i in raw {
 			if split := strings.index_byte(entry, '='); split >= 0 {
+				// M5 keep: Env_Info is a value with no failure channel of its
+				// own, and this builder is reached from main's start-up and
+				// report paths (the config warning, the usage block) and from
+				// the test helpers — none of which has a status to answer with.
+				// Recorded as this sweep's residual in
+				// docs/rating/HTThor-remediation-backlog.md.
 				env.vars[i] = Env_Var {
 					name  = strings.clone(entry[:split], allocator) or_else "",
 					value = strings.clone(entry[split + 1:], allocator) or_else "",
 				}
 			} else {
-				env.vars[i] = Env_Var{name = strings.clone(entry, allocator) or_else ""}
+				env.vars[i] = Env_Var{name = strings.clone(entry, allocator) or_else ""} // M5 keep.
 			}
 		}
 	}
@@ -166,12 +176,18 @@ env_info_from_strings :: proc(
 		env.vars = make([]Env_Var, len(entries), allocator)
 		for entry, i in entries {
 			if split := strings.index_byte(entry, '='); split >= 0 {
+				// M5 keep: Env_Info is a value with no failure channel of its
+				// own, and this builder is reached from main's start-up and
+				// report paths (the config warning, the usage block) and from
+				// the test helpers — none of which has a status to answer with.
+				// Recorded as this sweep's residual in
+				// docs/rating/HTThor-remediation-backlog.md.
 				env.vars[i] = Env_Var {
 					name  = strings.clone(entry[:split], allocator) or_else "",
 					value = strings.clone(entry[split + 1:], allocator) or_else "",
 				}
 			} else {
-				env.vars[i] = Env_Var{name = strings.clone(entry, allocator) or_else ""}
+				env.vars[i] = Env_Var{name = strings.clone(entry, allocator) or_else ""} // M5 keep.
 			}
 		}
 	}
@@ -209,6 +225,27 @@ colors_from_env :: proc(env: Env_Info) -> int {
 		}
 	}
 	return DEFAULT_COLORS
+}
+
+// TERMINAL_ESCAPES_ENV is the one environment switch the port reads that the
+// reference has no idea about: see allow_terminal_escapes.
+TERMINAL_ESCAPES_ENV :: "HTTHOR_ALLOW_TERMINAL_ESCAPES"
+
+// AUTH_PASSWORD_ENV is where a `--auth user` with no password takes it from:
+// the reference prompts on the terminal (getpass), which the port has no layer
+// for, and sending `user:` with an empty password is a wrong request rather
+// than a prompt (session/context.odin, build_request; backlog M4).
+AUTH_PASSWORD_ENV :: "HTTHOR_AUTH_PASSWORD"
+
+// allow_terminal_escapes reports whether the terminal sanitiser is turned off.
+// The port replaces the control bytes of what it prints to a terminal instead of
+// obeying them (output/sanitize_terminal_text), which is a deliberate divergence
+// from httpie; this variable is the escape hatch for someone who wants the
+// reference's raw bytes on their own terminal. Anything but "" and "0" turns the
+// sanitiser off (backlog M2).
+allow_terminal_escapes :: proc(env: Env_Info) -> bool {
+	value, found := env_get(env, TERMINAL_ESCAPES_ENV)
+	return found && value != "" && value != "0"
 }
 
 // EIGHT_COLOR_TERMS are the terminal descriptions whose terminfo entry reports
@@ -363,6 +400,11 @@ Options :: struct {
 	// ciphersuite list). It is owned here and handed to the transport, which
 	// applies it with CURLOPT_SSL_CIPHER_LIST.
 	ciphers:        string,
+	// ssl_version is `--ssl`: the protocol floor, spelled as the parser's
+	// choice list spells it (`ssl2.3`, `tls1`, `tls1.1`, `tls1.2`). Like
+	// ciphers it is owned here and handed to the transport, which maps it onto
+	// CURLOPT_SSLVERSION; the empty string means "libcurl's own default".
+	ssl_version:    string,
 	proxy:          [dynamic]string, // --proxy, repeatable
 	cert:           string,
 	cert_key:       string,
@@ -424,9 +466,11 @@ DEFAULT_MAX_REDIRECTS :: 30
 
 // options_default builds the option set httpie starts from, given the program
 // name the binary was invoked as (the name selects the default URL scheme and
-// appears in the usage text).
-options_default :: proc(allocator: mem.Allocator, program_name: string) -> Options {
-	opts := Options {
+// appears in the usage text). False is the program name's copy failing — an
+// Options with no name would print every message under the wrong one — and the
+// partial set is released before it answers (backlog M5).
+options_default :: proc(allocator: mem.Allocator, program_name: string) -> (opts: Options, ok: bool) {
+	opts = Options {
 		allocator      = allocator,
 		script_scheme  = .HTTP,
 		method         = .GET,
@@ -440,13 +484,15 @@ options_default :: proc(allocator: mem.Allocator, program_name: string) -> Optio
 		proxy          = make([dynamic]string, allocator),
 		item_set       = item_set_create(allocator),
 	}
-	name := strings.clone(program_name, allocator) or_else ""
-	opts.program_name = name
+	if !http.clone_into(&opts.program_name, program_name, allocator) {
+		options_destroy(&opts)
+		return {}, false
+	}
 	// `https` (and `htthor-https`) defaults to https://, `http` to http://.
 	if strings.has_suffix(program_name, "https") {
 		opts.script_scheme = .HTTPS
 	}
-	return opts
+	return opts, true
 }
 
 // options_destroy releases everything the Options owns and zeroes it. Calling
@@ -475,6 +521,7 @@ options_destroy :: proc(opts: ^Options) {
 	delete(opts.boundary, opts.allocator)
 	delete(opts.verify, opts.allocator)
 	delete(opts.ciphers, opts.allocator)
+	delete(opts.ssl_version, opts.allocator)
 	delete(opts.cert, opts.allocator)
 	delete(opts.cert_key, opts.allocator)
 	delete(opts.cert_key_pass, opts.allocator)
@@ -487,17 +534,4 @@ options_destroy :: proc(opts: ^Options) {
 	delete(opts.session_read_only, opts.allocator)
 	env_info_destroy(&opts.env, opts.allocator)
 	opts^ = {}
-}
-
-// print_set_default is httpie's tty-sensitive --print default
-// (docs/PARITY.md §4.1): `b` when stdout is not a tty, `hb` on a terminal,
-// `HB` in --offline mode regardless of the tty.
-print_set_default :: proc(stdout_is_tty: bool, offline: bool) -> Print_Set {
-	if offline {
-		return {.Request_Headers, .Request_Body}
-	}
-	if stdout_is_tty {
-		return {.Response_Headers, .Response_Body}
-	}
-	return {.Response_Body}
 }

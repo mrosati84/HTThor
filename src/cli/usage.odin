@@ -263,13 +263,6 @@ PRETTY_CHOICES := [?]string{"all", "colors", "format", "none"}
 // LibreSSL-safe subset of OpenSSL's protocol names.
 SSL_VERSION_CHOICES := [?]string{"ssl2.3", "tls1", "tls1.1", "tls1.2"}
 
-// AUTH_TYPE_CHOICES is the *load order* of the auth plugins, which is what the
-// usage line shows (httpie/cli/definition.py builds the choice list from
-// `plugin_manager.get_auth_plugin_mapping()` without sorting it); the error
-// message shows the same set sorted, because `--auth-type`'s action is a
-// `LazyChoices` with `sort=True`.
-AUTH_TYPE_CHOICES := [?]string{"basic", "digest", "bearer"}
-
 // AUTH_TYPE_CHOICES_SORTED is what `', '.join(map(repr, action.choices))`
 // produces for `--auth-type` (the action iterates its choices sorted).
 AUTH_TYPE_CHOICES_SORTED := [?]string{"basic", "bearer", "digest"}
@@ -280,33 +273,6 @@ AUTH_TYPE_CHOICES_SORTED := [?]string{"basic", "bearer", "digest"}
 
 style_is_valid :: proc(name: string) -> bool {
 	for candidate in STYLE_NAMES {
-		if candidate == name {
-			return true
-		}
-	}
-	return false
-}
-
-auth_type_is_valid :: proc(name: string) -> bool {
-	for candidate in AUTH_TYPE_CHOICES {
-		if candidate == name {
-			return true
-		}
-	}
-	return false
-}
-
-ssl_version_is_valid :: proc(name: string) -> bool {
-	for candidate in SSL_VERSION_CHOICES {
-		if candidate == name {
-			return true
-		}
-	}
-	return false
-}
-
-pretty_is_valid :: proc(name: string) -> bool {
-	for candidate in PRETTY_CHOICES {
 		if candidate == name {
 			return true
 		}
@@ -499,33 +465,6 @@ usage_error_text :: proc(
 
 	// rich's `print` ends the block; httpie's SystemExit handler adds one more
 	// newline (httpie/core.py:93).
-	strings.write_string(&b, "\n")
-	return strings.to_string(b)
-}
-
-// usage_block_text is the `usage:` half of usage_error_text, for callers that
-// want to check the usage line on its own. `width` is the same console width
-// usage_error_text wraps to, and the label is wrapped with the line exactly as
-// it is there (httpie's first `print` is one Text) — a zero-width console
-// renders nothing, that `print`'s own newline included.
-usage_block_text :: proc(
-	program_name, message: string,
-	width: int,
-	allocator: mem.Allocator,
-) -> string {
-	whitelist_entry := ""
-	if entry, ok := blamed_option_entry(message); ok {
-		whitelist_entry = entry
-	}
-	line := usage_line_text(program_name, whitelist_entry, allocator)
-	defer delete(line, allocator)
-	block := strings.concatenate({"usage:\n    ", line}, allocator)
-	defer delete(block, allocator)
-	b := strings.builder_make(allocator)
-	if console_silent(width) {
-		return strings.to_string(b)
-	}
-	write_wrapped(&b, block, width, allocator)
 	strings.write_string(&b, "\n")
 	return strings.to_string(b)
 }

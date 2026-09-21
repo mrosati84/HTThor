@@ -251,6 +251,13 @@ value_destroy :: proc(v: ^Value, allocator: mem.Allocator) {
 // build/probe_frozen_dict.py). The recursion is what the hook's own recursion
 // does — every object of the document, however deep, including the ones inside
 // arrays. Idempotent.
+// M5 KEEP (the two HACK_KEY copies below): this is an in-place drill that
+// answers nothing, and the pair it builds here is read back by the recursion
+// itself (the nested `value_freeze` calls and the `:=` item path, which does
+// have a message channel). Reporting a failed copy means giving the whole drill
+// a failure channel and threading it through every recursive step; that is this
+// sweep's recorded residual in docs/rating/HTThor-remediation-backlog.md rather
+// than a half-threaded bool.
 value_freeze :: proc(v: ^Value, allocator: mem.Allocator) {
 	#partial switch value in v^ {
 	case Object:
@@ -261,8 +268,8 @@ value_freeze :: proc(v: ^Value, allocator: mem.Allocator) {
 		if len(value.members) > 0 {
 			live = make([]Member, 1, allocator)
 			live[0] = Member {
-				key   = strings.clone(HACK_KEY, allocator) or_else "",
-				value = strings.clone(HACK_KEY, allocator) or_else "",
+				key   = strings.clone(HACK_KEY, allocator) or_else "", // M5 keep: see above.
+				value = strings.clone(HACK_KEY, allocator) or_else "", // M5 keep.
 			}
 		}
 		pairs := value.members
@@ -1120,24 +1127,32 @@ parse_object :: proc(p: ^Parser, err: ^JSON_Error) -> Value {
 // exactly as it is and the *form encoder* is where the character is refused
 // (src/http/python_str.odin's Lone_Surrogate, which is also what
 // `-f a:="\udcff"` already goes through for a byte that has no utf-8 encoding).
-value_to_form_string :: proc(v: Value, allocator: mem.Allocator) -> Value {
+//
+// `ok` is false when the one copy below could not be made: a `True`/`False` form
+// part is a value the reference sends, so the caller (item_set_add) reports the
+// failure rather than send an empty one (backlog M5).
+value_to_form_string :: proc(v: Value, allocator: mem.Allocator) -> (text: Value, ok: bool) {
 	switch value in v {
 	case string, Surrogate_String:
-		return value
+		return value, true
 	case i64:
-		return fmt.aprintf("%d", value, allocator = allocator)
+		return fmt.aprintf("%d", value, allocator = allocator), true
 	case f64:
 		if value == f64(i64(value)) && value < 1e16 && value > -1e16 {
-			return fmt.aprintf("%d.0", i64(value), allocator = allocator)
+			return fmt.aprintf("%d.0", i64(value), allocator = allocator), true
 		}
-		return fmt.aprintf("%v", value, allocator = allocator)
+		return fmt.aprintf("%v", value, allocator = allocator), true
 	case bool:
-		return strings.clone(value ? "True" : "False", allocator) or_else ""
+		printed, clone_err := strings.clone(value ? "True" : "False", allocator)
+		if clone_err != .None {
+			return Null{}, false
+		}
+		return printed, true
 	case Null, []Value, Object:
 		// Complex values are rejected by the caller before it gets here.
-		return v
+		return v, true
 	}
-	return v
+	return v, true
 }
 
 // ---------------------------------------------------------------------------

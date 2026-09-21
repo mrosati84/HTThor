@@ -3,9 +3,9 @@ package http
 import "core:io"
 
 // Backend names the transport compiled into the binary. The scaffold ships
-// exactly one: libcurl (see libcurl.odin, curl_transport.odin and
-// docs/ARCHITECTURE.md, "HTTP/TLS backend"). A second backend would be added
-// here and selected in the session.
+// exactly one: libcurl (see libcurl.odin, curl_transport.odin, and the
+// "Transport" paragraph in README.md). A second backend would be added here and
+// selected in the session.
 Backend :: enum {
 	Libcurl,
 }

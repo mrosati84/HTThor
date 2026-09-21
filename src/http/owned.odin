@@ -1,8 +1,9 @@
 // Allocator-explicit container helpers.
 //
 // Why these exist: `append` on a *plain* slice (and on a nil slice) allocates
-// through `context.allocator`, which docs/ARCHITECTURE.md §4 forbids anywhere
-// under src/ — the allocator is read once, in main, and passed down. `[dynamic]T`
+// through `context.allocator`, which the allocator rule in README.md's
+// "Architecture" section forbids anywhere under src/ — the allocator is read
+// once, in main, and passed down. `[dynamic]T`
 // keeps its own allocator, so the places that can use one do; the Request's
 // frozen `[]Header` / `[]Query_Param` / `[]Data_Item` fields cannot, so growing
 // them goes through slice_push.
@@ -47,6 +48,33 @@ clone_into :: proc(field: ^string, value: string, allocator: mem.Allocator) -> b
 	delete(field^, allocator)
 	field^ = clone
 	return true
+}
+
+// clone_or_oom takes an owned copy of `value` and reports whether it could be
+// made. False means the allocation failed: `clone` is the empty string and
+// *nothing was allocated*, so there is nothing to free.
+//
+// Why this exists rather than `strings.clone(…) or_else ""`: an empty string is
+// a legitimate HTTP value (a header with no value, a cookie with no path, an
+// option at its default), so a discarded `mem.Allocator_Error` turns a failed
+// copy into a *wrong request* instead of a failure the caller can report
+// (backlog M5). Callers with no failure channel of their own keep the plain
+// `or_else` form and say so at the site.
+//
+// Prefer `clone_into` when the copy goes into a field: it releases the old
+// value, which this helper cannot know about.
+clone_or_oom :: proc(value: string, allocator: mem.Allocator) -> (clone: string, ok: bool) {
+	if value == "" {
+		// Nothing to copy. Decided here rather than left to the allocator so
+		// that an *empty* value is a success whatever the allocator does with
+		// a zero-byte request.
+		return "", true
+	}
+	copy, err := strings.clone(value, allocator)
+	if err != .None {
+		return "", false
+	}
+	return copy, true
 }
 
 // Buffer is a growable byte buffer whose memory has an explicit owner: a

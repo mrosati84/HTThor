@@ -1048,8 +1048,12 @@ xml_render :: proc(
 		written += 1
 	}
 
-	out := strings.clone(strings.to_string(result), allocator) or_else ""
-	strings.builder_destroy(&result)
+	// The builder's buffer *is* the result: it is handed over as the caller's
+	// string (the builder is zeroed so nothing is left to destroy), which is
+	// what removes the copy — and with it the only allocation in this proc that
+	// could fail (backlog M5).
+	out := strings.to_string(result)
+	result = {}
 	return out
 }
 

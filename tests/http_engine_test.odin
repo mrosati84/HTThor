@@ -1413,6 +1413,366 @@ test_engine_streams_the_body_of_a_redirect_status_without_a_location :: proc(t: 
 	engine_no_leaks(t, &track)
 }
 
+// The rewrite itself, verb by verb: the 301 is the status whose rewrite is a
+// POST's alone, the 302 is the one HEAD survives, and every other verb a
+// followed 301/302 answers comes out a GET with the body purged
+// (`redirect_method`, requests' `rebuild_method`, sessions.py:370-392).
+
+@(test)
+test_engine_rewrites_a_301_post_to_get :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	server, started := engine_server_start(backing)
+	testing.expect(t, started, "the echo server must start")
+	// `if method == 'POST': method = 'GET'` — and *only* a POST
+	// (sessions.py:373-376, the 301 branch of `rebuild_method`).
+	engine_queue_reply(server, "HTTP/1.1 301 Moved Permanently\r\nLocation: /moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+
+	url := engine_url(server, "/first", allocator)
+	request, create_err := http.request_create(allocator, .POST, url, nil)
+	testing.expect_value(t, create_err, http.Error.None)
+	request.follow_redirects = true
+	request.max_redirects = 5
+	testing.expect_value(
+		t,
+		http.request_add_items(&request, []http.Data_Item{{kind = .String, name = "a", value = "1"}}),
+		http.Error.None,
+	)
+
+	response: http.Response
+	testing.expect_value(t, engine_send(t, &request, &response), http.Error.None)
+	testing.expect_value(t, response.status, 200)
+	testing.expect_value(t, len(response.history), 2)
+	if len(response.history) == 2 {
+		testing.expect_value(t, response.history[0].status, 301)
+		testing.expect_value(t, response.history[1].method, http.Method.GET)
+	}
+
+	first := engine_request_clone(server, 0, allocator) or_else ""
+	second := engine_request_clone(server, 1, allocator) or_else ""
+	testing.expect_value(t, engine_request_line(first), "POST /first HTTP/1.1")
+	testing.expect_value(t, engine_request_line(second), "GET /moved HTTP/1.1")
+	// The purge travels with the rewrite: the body and the two headers that
+	// described it are gone (`resolve_redirects`, sessions.py:249-258).
+	testing.expect_value(t, engine_body_of(second), "")
+	_, has_length := engine_header_of(second, "Content-Length")
+	testing.expect(t, !has_length, "a purged GET must not announce a length")
+	_, has_type := engine_header_of(second, "Content-Type")
+	testing.expect(t, !has_type, "a purged GET must not carry the body's Content-Type")
+
+	http.response_destroy(&response)
+	http.request_destroy(&request)
+	delete(url, allocator)
+	delete(first, allocator)
+	delete(second, allocator)
+	engine_server_destroy(server)
+	engine_no_leaks(t, &track)
+}
+
+@(test)
+test_engine_keeps_a_puts_method_across_a_301 :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	server, started := engine_server_start(backing)
+	testing.expect(t, started, "the echo server must start")
+	// The other half of the same branch: a PUT on a 301 keeps its method, and
+	// only its body and the three body headers are purged (sessions.py:1807-1817
+	// of `resolve_redirects`, which rewrites nothing here).
+	engine_queue_reply(server, "HTTP/1.1 301 Moved Permanently\r\nLocation: /moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+
+	url := engine_url(server, "/first", allocator)
+	request, create_err := http.request_create(allocator, .PUT, url, nil)
+	testing.expect_value(t, create_err, http.Error.None)
+	request.follow_redirects = true
+	request.max_redirects = 5
+	testing.expect_value(
+		t,
+		http.request_add_items(&request, []http.Data_Item{{kind = .String, name = "a", value = "1"}}),
+		http.Error.None,
+	)
+
+	response: http.Response
+	testing.expect_value(t, engine_send(t, &request, &response), http.Error.None)
+	testing.expect_value(t, response.status, 200)
+	testing.expect_value(t, len(response.history), 2)
+	if len(response.history) == 2 {
+		testing.expect_value(t, response.history[1].method, http.Method.PUT)
+	}
+
+	second := engine_request_clone(server, 1, allocator) or_else ""
+	testing.expect_value(t, engine_request_line(second), "PUT /moved HTTP/1.1")
+	testing.expect_value(t, engine_body_of(second), "")
+	// `body_to_chunks` recommends the framing line for a body-less verb
+	// outside urllib3's `_METHODS_NOT_EXPECTING_BODY`, and `_send_request`
+	// writes it ahead of the head's own lines (util/request.py:57, :251-256;
+	// connection.py:543-560) — a PUT is outside that set, so the purged hop
+	// still announces a zero length.
+	length, has_length := engine_header_of(second, "Content-Length")
+	testing.expectf(t, has_length, "a purged PUT must still announce its framing")
+	testing.expect_value(t, length, "0")
+
+	http.response_destroy(&response)
+	http.request_destroy(&request)
+	delete(url, allocator)
+	delete(second, allocator)
+	engine_server_destroy(server)
+	engine_no_leaks(t, &track)
+}
+
+@(test)
+test_engine_rewrites_a_302_for_a_non_head_verb :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	server, started := engine_server_start(backing)
+	testing.expect(t, started, "the echo server must start")
+	// A 302 is the 303's rule: everything but HEAD becomes a GET — the case
+	// that separated the 302 from the 301 (sessions.py:378-381).
+	engine_queue_reply(server, "HTTP/1.1 302 Found\r\nLocation: /moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+
+	url := engine_url(server, "/first", allocator)
+	request, create_err := http.request_create(allocator, .PUT, url, nil)
+	testing.expect_value(t, create_err, http.Error.None)
+	request.follow_redirects = true
+	request.max_redirects = 5
+	testing.expect_value(
+		t,
+		http.request_add_items(&request, []http.Data_Item{{kind = .String, name = "a", value = "1"}}),
+		http.Error.None,
+	)
+
+	response: http.Response
+	testing.expect_value(t, engine_send(t, &request, &response), http.Error.None)
+	testing.expect_value(t, response.status, 200)
+	testing.expect_value(t, len(response.history), 2)
+	if len(response.history) == 2 {
+		testing.expect_value(t, response.history[1].method, http.Method.GET)
+	}
+
+	second := engine_request_clone(server, 1, allocator) or_else ""
+	testing.expect_value(t, engine_request_line(second), "GET /moved HTTP/1.1")
+	testing.expect_value(t, engine_body_of(second), "")
+	// A GET is one of the six verbs urllib3 expects no body for, so the purge
+	// writes no framing line for it (util/request.py:57).
+	_, has_length := engine_header_of(second, "Content-Length")
+	testing.expect(t, !has_length, "the rewritten GET must not announce a length")
+
+	http.response_destroy(&response)
+	http.request_destroy(&request)
+	delete(url, allocator)
+	delete(second, allocator)
+	engine_server_destroy(server)
+	engine_no_leaks(t, &track)
+}
+
+// A HEAD is the single verb the 302 keeps, and the hop it keeps is also the one
+// libcurl cannot be asked for both halves of: CURLOPT_NOBODY would take the
+// request body with it, so the switch is only set for a HEAD whose request
+// carries no byte at all, and the rest are cut at the end of the reply head
+// (see `Transfer.head_reply_only`). This is the bodyless case on the wire.
+@(test)
+test_engine_keeps_head_across_a_redirect :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	server, started := engine_server_start(backing)
+	testing.expect(t, started, "the echo server must start")
+	engine_queue_reply(server, "HTTP/1.1 302 Found\r\nLocation: /moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+
+	url := engine_url(server, "/first", allocator)
+	request, create_err := http.request_create(allocator, .HEAD, url, nil)
+	testing.expect_value(t, create_err, http.Error.None)
+	request.follow_redirects = true
+	request.max_redirects = 5
+
+	response: http.Response
+	testing.expect_value(t, engine_send(t, &request, &response), http.Error.None)
+	testing.expect_value(t, response.status, 200)
+	// The reply to a HEAD is its head: no body bytes, and the Content-Length
+	// the server announced is not read as one (CPython 3.11.15
+	// Lib/http/client.py:381-385, :462-469).
+	testing.expect_value(t, string(response.body), "")
+	testing.expect_value(t, len(response.history), 2)
+	if len(response.history) == 2 {
+		testing.expect_value(t, response.history[1].method, http.Method.HEAD)
+	}
+
+	first := engine_request_clone(server, 0, allocator) or_else ""
+	second := engine_request_clone(server, 1, allocator) or_else ""
+	testing.expect_value(t, engine_request_line(first), "HEAD /first HTTP/1.1")
+	testing.expect_value(t, engine_request_line(second), "HEAD /moved HTTP/1.1")
+	// HEAD is in `_METHODS_NOT_EXPECTING_BODY`, so the purge writes it no
+	// framing line either (util/request.py:57).
+	_, has_length := engine_header_of(second, "Content-Length")
+	testing.expect(t, !has_length, "a purged HEAD must not announce a length")
+
+	http.response_destroy(&response)
+	http.request_destroy(&request)
+	delete(url, allocator)
+	delete(first, allocator)
+	delete(second, allocator)
+	engine_server_destroy(server)
+	engine_no_leaks(t, &track)
+}
+
+// The three ways the redirect question itself answers "no", each of which used
+// to be a `break` inside the loop: a target with no adapter (requests refuses
+// it in `Session.get_adapter`), a Location the utf-8 codec rejects (requests
+// decodes it in `get_redirect_target`), and an empty one (`while url:` ends).
+
+@(test)
+test_engine_refuses_a_redirect_target_without_an_adapter :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	server, started := engine_server_start(backing)
+	testing.expect(t, started, "the echo server must start")
+	// httpie mounts `http://` and `https://` and nothing else, so a Location
+	// with any other scheme matches no adapter: requests raises
+	// `InvalidSchema` before anything connects (sessions.py:870-881).
+	engine_queue_reply(server, "HTTP/1.1 302 Found\r\nLocation: ftp://127.0.0.1:1/landing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+
+	url := engine_url(server, "/first", allocator)
+	request, create_err := http.request_create(allocator, .GET, url, nil)
+	testing.expect_value(t, create_err, http.Error.None)
+	request.follow_redirects = true
+	request.max_redirects = 5
+
+	response: http.Response
+	testing.expect_value(t, engine_send(t, &request, &response), http.Error.No_Connection_Adapter)
+	// A failed send leaves the reply zeroed; the chain it made is published on
+	// the *request*, and it ends with the refused target — httpie printed that
+	// request before the send that refused it (`yield prepared_request`,
+	// client.py:105). The hop in flight is the 302 request itself, and like
+	// every hop whose follow was cut short it joins as a request-only entry:
+	// the refusal is decided before the completed hop is recorded
+	// (follow_abort_refused).
+	testing.expect_value(t, response.status, 0)
+	testing.expect_value(t, len(response.history), 0)
+	testing.expect_value(t, len(request.follow_history), 2)
+	if len(request.follow_history) == 2 {
+		testing.expect_value(t, request.follow_history[0].status, 0)
+		testing.expect(t, strings.has_suffix(request.follow_history[0].url, "/first"),
+		               "the hop in flight is the request that was answered")
+		testing.expect_value(t, request.follow_history[1].method, http.Method.GET)
+		testing.expect_value(t, request.follow_history[1].url, "ftp://127.0.0.1:1/landing")
+	}
+	// The message requests prints quotes the URL it held, and the error owns
+	// it (request_destroy releases it).
+	testing.expect(t, request.adapter_error.failed, "the refusal must name its URL")
+	testing.expect_value(t, request.adapter_error.url, "ftp://127.0.0.1:1/landing")
+
+	// Nothing was asked of libcurl for the refused target.
+	second, has_second := engine_request_clone(server, 1, allocator)
+	testing.expect(t, !has_second, "a target with no adapter must not be sent")
+	if has_second {
+		delete(second, allocator)
+	}
+
+	http.request_destroy(&request)
+	delete(url, allocator)
+	engine_server_destroy(server)
+	engine_no_leaks(t, &track)
+}
+
+@(test)
+test_engine_refuses_a_location_the_codec_rejects :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	server, started := engine_server_start(backing)
+	testing.expect(t, started, "the echo server must start")
+	// `to_native_string(location, "utf8")` — the header's bytes are handed to
+	// the codec before the hop is made, and `\xff` is not a utf-8 start byte
+	// (sessions.py:142-151; the port holds the header as the bytes it arrived
+	// in, §3.6, so the codec is a check and not a conversion).
+	engine_queue_reply(server, "HTTP/1.1 302 Found\r\nLocation: /\xffbad\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+
+	url := engine_url(server, "/first", allocator)
+	request, create_err := http.request_create(allocator, .GET, url, nil)
+	testing.expect_value(t, create_err, http.Error.None)
+	request.follow_redirects = true
+	request.max_redirects = 5
+
+	response: http.Response
+	testing.expect_value(t, engine_send(t, &request, &response), http.Error.Redirect_Location_Not_Utf8)
+	testing.expect_value(t, response.status, 0)
+	// The session prints the codec's own message from the request.
+	testing.expect(t, request.location_error.failed, "the refused Location must be recorded")
+	testing.expect_value(t, len(request.follow_history), 1)
+
+	second, has_second := engine_request_clone(server, 1, allocator)
+	testing.expect(t, !has_second, "a Location the codec refuses must not be followed")
+	if has_second {
+		delete(second, allocator)
+	}
+
+	http.request_destroy(&request)
+	delete(url, allocator)
+	engine_server_destroy(server)
+	engine_no_leaks(t, &track)
+}
+
+@(test)
+test_engine_answers_a_redirect_whose_location_is_empty :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	server, started := engine_server_start(backing)
+	testing.expect(t, started, "the echo server must start")
+	// `while url:` — an empty target is falsy, so the chain stops on the 3xx
+	// and the reply is the caller's (sessions.py:204).
+	engine_queue_reply(server, "HTTP/1.1 302 Found\r\nLocation: \r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+
+	url := engine_url(server, "/first", allocator)
+	request, create_err := http.request_create(allocator, .GET, url, nil)
+	testing.expect_value(t, create_err, http.Error.None)
+	request.follow_redirects = true
+	request.max_redirects = 5
+
+	response: http.Response
+	testing.expect_value(t, engine_send(t, &request, &response), http.Error.None)
+	testing.expect_value(t, response.status, 302)
+	testing.expect_value(t, len(response.history), 1)
+	testing.expect(t, strings.has_suffix(response.url, "/first"),
+	               "the reply stays the hop that was asked for")
+
+	second, has_second := engine_request_clone(server, 1, allocator)
+	testing.expect(t, !has_second, "an empty Location must not be followed")
+	if has_second {
+		delete(second, allocator)
+	}
+
+	http.response_destroy(&response)
+	http.request_destroy(&request)
+	delete(url, allocator)
+	engine_server_destroy(server)
+	engine_no_leaks(t, &track)
+}
+
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------

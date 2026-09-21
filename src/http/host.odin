@@ -236,6 +236,9 @@ host_error_message :: proc(err: ^Host_Error, allocator: mem.Allocator) -> string
 @(private)
 host_error_url :: proc(err: ^Host_Error, allocator: mem.Allocator) -> string {
 	if err.url_prefix == "" {
+		// M5 report: this clones the message the caller is already building, so
+		// the copy's own failure only means the report could not be allocated —
+		// the same shape as the parser's `clone("not enough memory")` idiom.
 		return strings.clone(err.text, allocator) or_else ""
 	}
 	return fmt.aprintf("%s%s", err.url_prefix, err.text, allocator = allocator)
@@ -368,10 +371,13 @@ url_host_normalize :: proc(
 	host_owned := false
 	host_taken := false
 	if joined != "" {
-		host = strings.clone(host, allocator) or_else ""
-		if host == "" {
+		// The copy has a channel here: an allocation that fails is reported
+		// rather than read as an empty host (http/owned.odin, `clone_or_oom`).
+		host_copy, ok := clone_or_oom(host, allocator)
+		if !ok {
 			return "", .Out_Of_Memory
 		}
+		host = host_copy
 		host_owned = true
 	}
 	defer if host_owned && !host_taken {
@@ -615,10 +621,13 @@ url_host_normalize_flat :: proc(
 	host_owned := false
 	host_taken := false
 	if joined != "" {
-		host = strings.clone(host, allocator) or_else ""
-		if host == "" {
+		// As above: a copy that cannot be made is a reported failure, not an
+		// empty host.
+		host_copy, ok := clone_or_oom(host, allocator)
+		if !ok {
 			return "", .Out_Of_Memory
 		}
+		host = host_copy
 		host_owned = true
 	}
 	defer if host_owned && !host_taken {
@@ -735,10 +744,15 @@ url_host_labels_into :: proc(
 					// The label is a slice of the *folded* host, which does not
 					// outlive this call, and the message outlives it by a
 					// render: the copy is what keeps the quoted bytes alive
-					// (`host_error_destroy` releases it).
+					// (`host_error_destroy` releases it). A copy that cannot be
+					// made is reported rather than quoted as nothing.
+					text_copy, ok := clone_or_oom(label, allocator)
+					if !ok {
+						return .Out_Of_Memory
+					}
 					err^ = {
 						kind  = .Invalid_Name,
-						text  = strings.clone(label, allocator) or_else "",
+						text  = text_copy,
 						owned = true,
 					}
 				}

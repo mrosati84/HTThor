@@ -384,9 +384,10 @@ Request :: struct {
 	// definition.py:715-722). The key is dropped when the URL is built; an
 	// entry without a key is taken as the URL itself (proxy.odin).
 	proxy:    string,
-	// cert / cert_key / cert_key_pass / ca_bundle / ciphers / proxy are BORROWED
-	// from cli.Options — the session aliases them in and only cli.options_destroy
-	// frees them (ARCHITECTURE §4). Nothing here may release them.
+	// cert / cert_key / cert_key_pass / ca_bundle / ciphers / ssl_version /
+	// proxy are BORROWED from cli.Options — the session aliases them in and
+	// only cli.options_destroy frees them (ARCHITECTURE §4). Nothing here may
+	// release them.
 	cert:          string,
 	cert_key:      string,
 	cert_key_pass: string,
@@ -398,6 +399,11 @@ Request :: struct {
 	// library verbatim (CURLOPT_SSL_CIPHER_LIST). A list the library cannot use
 	// fails the handshake — the loud failure the help text promises.
 	ciphers: string,
+	// ssl_version is `--ssl`: the name of the protocol floor the request may
+	// negotiate (`tls1`, `tls1.1`, `tls1.2`, or `ssl2.3` for "auto"), or the
+	// empty string for libcurl's own default. curl_transport maps it onto
+	// CURLOPT_SSLVERSION; like ciphers it is BORROWED from cli.Options.
+	ssl_version: string,
 	// cookie_hook re-derives a followed hop's `Cookie` header from the session
 	// jar (Cookie_Hook above). BORROWED: its `data` is the session, which
 	// owns itself; the zero value means the run has no session and
@@ -483,6 +489,11 @@ Response :: struct {
 	http_version: string, // "HTTP/1.1"; "" when unknown
 	headers:      []Header,
 	body:         []byte,
+	// body_written is how many body bytes the transport handed to the caller's
+	// writer on the `send_to` path (0 when the body was buffered into `body`).
+	// A streamed body leaves no copy behind, so this is the only count the
+	// caller has — `--download` reports it as the transfer's progress.
+	body_written: int,
 	url:          string,      // the final URL, after any redirects
 	history:      []Exchange,  // every hop, oldest first, the final one last
 }
@@ -504,6 +515,11 @@ Error :: enum {
 	Too_Many_Redirects,
 	Max_Headers_Exceeded,
 	Write_Failed,
+	// Body_Too_Large is the buffered-body cap (MAX_BUFFERED_BODY): the caller
+	// supplied no writer and the reply grew past what the engine will hold in
+	// memory. The reference buffers without a limit and dies with the machine;
+	// the port stops and says so instead (backlog M3).
+	Body_Too_Large,
 	File_Read_Failed,
 	Unsupported_Body,
 	// Str_Not_Encodable is the UnicodeEncodeError the reference raises while it
@@ -560,6 +576,8 @@ error_message :: proc(err: Error) -> string {
 		return "the response head is larger than --max-headers allows"
 	case .Write_Failed:
 		return "failed to write the response body"
+	case .Body_Too_Large:
+		return "the response body is larger than the buffered-body cap (--download streams it instead)"
 	case .File_Read_Failed:
 		return "could not read the request body's file"
 	case .Unsupported_Body:

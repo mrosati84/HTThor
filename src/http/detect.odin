@@ -132,22 +132,11 @@ detect_matches :: proc(content: string, allocator: mem.Allocator) -> Detect_Resu
 	length := len(content)
 
 	if length == 0 {
-		// `from_bytes(b"")` is one utf_8 match with a chaos of 0.0 (api.py:94-99).
-		result.count = 1
-		result.items[0] = Detect_Match{encoding = "utf_8"}
-		return result
+		// `from_bytes(b"")` is one utf_8 match with a chaos of 0.0
+		// (api.py:94-99): detect_empty_payload_result.
+		return detect_empty_payload_result()
 	}
 
-	steps := 5
-	chunk_size := 512
-	if length <= chunk_size * steps {
-		steps = 1
-		chunk_size = length
-	}
-	if steps > 1 && length / steps < chunk_size {
-		chunk_size = length / steps
-	}
-	is_too_large := length >= DETECT_TOO_BIG_SEQUENCE
 
 	// The payload's own hints: a charset declared *inside* the bytes is
 	// `prioritized_encodings`' first entry, a BOM/SIG is inserted before it
@@ -155,44 +144,18 @@ detect_matches :: proc(content: string, allocator: mem.Allocator) -> Detect_Resu
 	specified := detect_any_specified_encoding(content)
 	sig_encoding, sig_length := detect_identify_sig_or_bom(content)
 
-	// A `utf_16`/`utf_32` BOM decides the answer outright where the payload after
-	// it has that codec's own shape, and the port has no decoder for either: the
-	// reference decodes such a payload with the mark's codec and returns
-	// `results[sig_encoding]` — the search ends there — as soon as that candidate
-	// passes its chaos probe, which a payload whose length is a whole number of
-	// code units is the case for.  What the port cannot reproduce is the
-	// *measurement* (the chaos and coherence of the decoded reading), so the
-	// match it answers with carries none; what it must not do is fall through to
-	// the single-byte candidates, which is where a `utf_16` body would otherwise
-	// land.  `utf_7` and gb18030's SIG are *not* treated this way: their codecs
-	// fail on payloads the reference hands them in practice (a `+/v8` mark
-	// followed by ASCII text is `ascii` to the reference, not `utf_7`), so those
-	// two stay part of the decoder gap and the loop skips them.
-	if sig_encoding == "utf_16" || sig_encoding == "utf_32" {
-		unit := sig_encoding == "utf_16" ? 2 : 4
-		if (length - sig_length) % unit == 0 {
-			result.count = 1
-			result.items[0] = Detect_Match{encoding = sig_encoding, bom = true}
-			return result
-		}
+	// A `utf_16`/`utf_32` BOM decides the answer outright where the payload
+	// after it has that codec's own shape (detect_bom_encoding_answer).
+	if match, decided := detect_bom_encoding_answer(sig_encoding, sig_length, length); decided {
+		result.count = 1
+		result.items[0] = match
+		return result
 	}
 
-	prioritized: [8]string
-	prioritized_count := 0
-	if sig_encoding != "" {
-		prioritized[prioritized_count] = sig_encoding
-		prioritized_count += 1
-	}
-	if specified != "" {
-		prioritized[prioritized_count] = specified
-		prioritized_count += 1
-	}
-	prioritized[prioritized_count] = "ascii"
-	prioritized_count += 1
-	if !detect_name_in(prioritized[:prioritized_count], "utf_8") {
-		prioritized[prioritized_count] = "utf_8"
-		prioritized_count += 1
-	}
+	// The payload's own hints, in the reference's order: the BOM/SIG first
+	// (api.py:153-228), then the declared charset, then ascii and utf_8
+	// (detect_prioritized_hints).
+	prioritized, prioritized_count := detect_prioritized_hints(sig_encoding, specified)
 
 	tested: [DETECT_MATCH_CAPACITY]string
 	tested_count := 0
@@ -212,93 +175,38 @@ detect_matches :: proc(content: string, allocator: mem.Allocator) -> Detect_Resu
 	definitive_target_languages: [8]string
 	definitive_target_count := 0
 	post_definitive_sb_success_count := 0
-	POST_DEFINITIVE_SB_CAP :: 7
 
-	// `cut_sequence_chunks`' offsets: `range(0 if not bom else len(sig), length,
-	// int(length / steps))` (api.py:386-390).
-	offsets: [DETECT_CHUNK_CAPACITY]int
-	offset_count := 0
-	offset_step := length / steps
-	offset_start := 0
-	if sig_encoding != "" {
-		offset_start = sig_length
-	}
-	for offset := offset_start; offset < length; offset += offset_step {
-		if offset_count >= len(offsets) {
-			break
-		}
-		offsets[offset_count] = offset
-		offset_count += 1
-	}
-	max_chunk_gave_up := offset_count / 4
-	if max_chunk_gave_up < 2 {
-		max_chunk_gave_up = 2
-	}
-
-	// The chunks a candidate yields are measured *and* scored for coherence, so
-	// they all have to be in hand at once.  A chunk is a slice of the payload
-	// decoded on the spot: one byte per character for a single-byte code page,
-	// at most as many bytes as it covers for utf-8.
-	chunk_room := 0
-	for offset_index in 0 ..< offset_count {
-		chunk_room += min(chunk_size, length - offsets[offset_index])
-	}
-	scratch := make([]u8, 4 * chunk_room + 64, allocator)
+	// The chunking plan the candidate loop walks — the offsets
+	// `cut_sequence_chunks` yields, the give-up budget, and the scratch the
+	// chunk slices are decoded into (detect_chunk_plan): the chunks a candidate
+	// yields are measured *and* scored for coherence, so they all have to be in
+	// hand at once.  A chunk is a slice of the payload decoded on the spot: one
+	// byte per character for a single-byte code page, at most as many bytes as
+	// it covers for utf-8.
+	plan := detect_chunk_plan(length, sig_encoding != "", sig_length)
+	scratch := make([]u8, 4 * plan.chunk_room + 64, allocator)
 	defer delete(scratch, allocator)
 
 	total_candidates := prioritized_count + len(DETECT_CANDIDATES)
 	for candidate_index in 0 ..< total_candidates {
-		name: string
-		multi_byte := false
-		kind := Detect_Port_Kind.Unsupported
-		if candidate_index < prioritized_count {
-			name = prioritized[candidate_index]
-			multi_byte, kind = detect_candidate_class(name)
-		} else {
-			candidate := DETECT_CANDIDATES[candidate_index - prioritized_count]
-			name = candidate.name
-			multi_byte = candidate.multi_byte
-			kind = candidate.kind
-		}
+		name, multi_byte, kind := detect_candidate_at(candidate_index, prioritized[:prioritized_count])
 
-		if detect_name_in(tested[:tested_count], name) {
-			continue
-		}
-		tested[tested_count] = name
-		tested_count += 1
-
-		// A BOM/SIG only ever is a mark of the utf-8 family, gb18030 or
-		// utf-16/utf-32, so `strip_sig_or_bom` is the reference's
-		// `should_strip_sig_or_bom` here: utf_16/utf_32 keep their mark.
-		bom_or_sig_available := sig_encoding != "" && sig_encoding == name
-		strip_sig_or_bom := bom_or_sig_available && name != "utf_16" && name != "utf_32"
-		// The bytes a decode starts from: the payload, minus a mark the codec
-		// is asked to strip.
-		body_offset := strip_sig_or_bom ? sig_length : 0
-
-		if (name == "utf_16" || name == "utf_32") && !bom_or_sig_available {
-			continue
-		}
-		if name == "utf_7" && !bom_or_sig_available {
-			continue
-		}
-		if detect_name_in(soft_skip[:soft_skip_count], name) {
-			continue
-		}
-
-		// `is_multi_byte_encoding`'s decoder probe and the decode that follows
-		// both fail for a code page this port has no table for: the reference's
-		// hard failure.  The boundary is in the file header.
-		if kind == .Unsupported {
-			continue
-		}
-
-		if definitive_match_found {
-			if !detect_languages_intersect(detect_targets(name), definitive_target_languages[:definitive_target_count]) {
-				continue
-			}
-		}
-		if definitive_match_found && !multi_byte && post_definitive_sb_success_count >= POST_DEFINITIVE_SB_CAP {
+		// This candidate's admission decision and the byte window its decoding
+		// starts from (detect_candidate_preamble).
+		preamble := detect_candidate_preamble(
+			name,
+			kind,
+			multi_byte,
+			sig_encoding,
+			sig_length,
+			definitive_match_found,
+			definitive_target_languages[:definitive_target_count],
+			post_definitive_sb_success_count,
+			&tested,
+			&tested_count,
+			soft_skip[:soft_skip_count],
+		)
+		if preamble.skip {
 			continue
 		}
 
@@ -307,7 +215,7 @@ detect_matches :: proc(content: string, allocator: mem.Allocator) -> Detect_Resu
 		// chunk slices decode to exactly the chunks the whole payload would
 		// have given, and a candidate the probing rejects never pays for it
 		// (api.py:332-340).
-		deferred_decoding := !multi_byte && !is_too_large
+		deferred_decoding := !multi_byte && !plan.is_too_large
 
 		decoded := ""
 		has_decoded := false
@@ -316,8 +224,8 @@ detect_matches :: proc(content: string, allocator: mem.Allocator) -> Detect_Resu
 		if kind == .Utf8 {
 			// The eager, strict, whole-payload decode of a multibyte candidate
 			// (api.py:342-374).
-			bytes := content[body_offset:]
-			if strip_sig_or_bom && strings.has_prefix(bytes, "\xef\xbb\xbf") {
+			bytes := content[preamble.body_offset:]
+			if preamble.strip_sig_or_bom && strings.has_prefix(bytes, "\xef\xbb\xbf") {
 				// utf_8_sig's own decoder drops a leading BOM as well.
 				bytes = bytes[3:]
 			}
@@ -327,185 +235,75 @@ detect_matches :: proc(content: string, allocator: mem.Allocator) -> Detect_Resu
 			decoded = bytes
 			decoded_length = detect_rune_count(bytes)
 			has_decoded = true
-		} else if is_too_large {
+		} else if plan.is_too_large {
 			// api.py:343-351: the first 500000 bytes are decoded eagerly — the
 			// reading is thrown away (it stays `None`), so this is the
 			// validation of the head of the payload.
 			stop := min(length, 500000)
-			start := min(body_offset, stop)
+			start := min(preamble.body_offset, stop)
 			if !detect_bytes_are_defined(name, content[start:stop]) {
 				continue
 			}
 		}
 
-		chunks: [DETECT_CHUNK_CAPACITY]string
-		chunk_count := 0
-		cursor := 0
-		lazy_str_hard_failure := false
-		hard_failure := false
-		early_stop_count := 0
+		// The candidate's chunks, sliced and decoded exactly as the reference's
+		// own branch for that code page does (detect_slice_candidate_chunks).
+		probe := detect_slice_candidate_chunks(
+			content,
+			name,
+			multi_byte,
+			deferred_decoding,
+			length,
+			sig_length,
+			preamble.bom_or_sig_available,
+			preamble.strip_sig_or_bom,
+			decoded,
+			has_decoded,
+			decoded_length,
+			plan,
+			scratch,
+		)
+		if probe.hard_failure {
+			continue
+		}
+		chunks := probe.chunks
+		chunk_count := probe.chunk_count
 
-		if multi_byte {
-			// `cut_sequence_chunks`' byte-slicing branch for a multibyte decoder
-			// (utils.py:401-452): the raw slice read with `errors="ignore"`, plus
-			// the bad-cut adjustment when a slice starts mid-sequence.
-			for offset_index in 0 ..< offset_count {
-				if chunk_count >= len(chunks) {
-					break
-				}
-				offset := offsets[offset_index]
-				chunk_end := offset + chunk_size
-				if chunk_end > length + 8 {
-					continue
-				}
-				cut_end := min(chunk_end, length)
-				cut := content[offset:cut_end]
-				if bom_or_sig_available && !strip_sig_or_bom {
-					cut, _ = strings.concatenate({content[:sig_length], cut}, context.temp_allocator)
-				}
-				chunk, _ := detect_write_utf8_ignore(cut, scratch[cursor:])
-				if offset > 0 && has_decoded {
-					partial := min(min(chunk_size, 16), len(chunk))
-					prefix := chunk[:partial]
-					expected_offset := offset * decoded_length / length
-					search_start := max(0, expected_offset - 32768)
-					search_end := min(decoded_length, expected_offset + 32768)
-					_, found_nearby := detect_find(decoded, prefix, search_start, search_end)
-					_, in_payload := detect_find(decoded, prefix, 0, len(decoded))
-					if !found_nearby && !in_payload {
-						for previous := offset; previous > offset - 4 && previous >= 0; previous -= 1 {
-							retry_cut := content[previous:cut_end]
-							if bom_or_sig_available && !strip_sig_or_bom {
-								retry_cut, _ = strings.concatenate({content[:sig_length], retry_cut}, context.temp_allocator)
-							}
-							retry_chunk, _ := detect_write_utf8_ignore(retry_cut, scratch[cursor:])
-							retry_partial := min(min(chunk_size, 16), len(retry_chunk))
-							if _, ok := detect_find(decoded, retry_chunk[:retry_partial], 0, len(decoded)); ok {
-								chunk = retry_chunk
-								break
-							}
-						}
-					}
-				}
-				chunks[chunk_count] = chunk
-				chunk_count += 1
-				cursor += len(chunk)
-			}
-		} else {
-			// The deferred (regular-size) and eager-truncated (huge) single-byte
-			// probing: raw slices decoded strictly, one byte per character.
-			// A chunk that does not decode ends the walk — a hard failure when
-			// the decoding was deferred, and `lazy_str_hard_failure` when the
-			// payload is huge (api.py:445-468).
-			for offset_index in 0 ..< offset_count {
-				if chunk_count >= len(chunks) {
-					break
-				}
-				offset := offsets[offset_index]
-				chunk_end := offset + chunk_size
-				// The trailing-slice guard is the *byte-slicing* branch's
-				// (utils.py:401-403).  A deferred single-byte candidate slices
-				// `sequences[i:i + chunk_size]` with no such guard
-				// (utils.py:394-396), so its last offset — `int(length / steps)`
-				// short of the end — still yields the tail of the payload, one
-				// or more bytes of it, and that short chunk is measured with the
-				// rest: a 2561-byte payload's candidate is the mean of six
-				// chunks, five of 512 bytes and one of one byte.
-				if !deferred_decoding && chunk_end > length + 8 {
-					continue
-				}
-				cut := content[offset:min(chunk_end, length)]
-				if len(cut) == 0 {
-					break
-				}
-				chunk, ok := detect_write_single_byte(name, cut, scratch[cursor:])
-				if !ok {
-					if deferred_decoding {
-						// Identical outcome and bookkeeping to the whole-payload
-						// decode failing: the candidate is out.
-						hard_failure = true
-					} else {
-						early_stop_count = max_chunk_gave_up
-						lazy_str_hard_failure = true
-					}
-					break
-				}
-				chunks[chunk_count] = chunk
-				chunk_count += 1
-				cursor += len(chunk)
-			}
-			if hard_failure {
-				continue
-			}
-		}
-
-		ratios: [DETECT_CHUNK_CAPACITY]f64
-		ratio_count := 0
-		for chunk_index in 0 ..< chunk_count {
-			ratio := detect_mess_ratio(chunks[chunk_index], 0.2)
-			ratios[ratio_count] = ratio
-			ratio_count += 1
-			if ratio >= 0.2 {
-				early_stop_count += 1
-			}
-			if early_stop_count >= max_chunk_gave_up || (bom_or_sig_available && !strip_sig_or_bom) {
-				break
-			}
-		}
-		// `sum(md_ratios) / len(md_ratios)`, summed in the reference's order.
-		mean_mess_ratio := 0.0
-		if ratio_count > 0 {
-			sum := 0.0
-			for ratio_index in 0 ..< ratio_count {
-				sum += ratios[ratio_index]
-			}
-			mean_mess_ratio = sum / f64(ratio_count)
-		}
+		// `sum(md_ratios) / len(md_ratios)`, summed in the reference's order,
+		// with the reference's own early stop (detect_measure_chunks).
+		mean_mess_ratio, early_stop_count := detect_measure_chunks(
+			chunks[:chunk_count],
+			probe.early_stop_count,
+			plan.max_chunk_gave_up,
+			preamble.bom_or_sig_available && !preamble.strip_sig_or_bom,
+		)
 
 		// A huge single-byte payload that survived so far has its tail checked
-		// as a whole (api.py:474-491).
-		if !lazy_str_hard_failure && is_too_large && !multi_byte && mean_mess_ratio < 0.2 && early_stop_count < max_chunk_gave_up {
-			if !detect_bytes_are_defined(name, content[50000:]) {
+		// as a whole (api.py:474-491): the 50000-byte window is
+		// detect_huge_candidate_tail_is_defined's.
+		if !probe.lazy_str_hard_failure && plan.is_too_large && !multi_byte && mean_mess_ratio < 0.2 && early_stop_count < plan.max_chunk_gave_up {
+			if !detect_huge_candidate_tail_is_defined(content, name) {
 				continue
 			}
 		}
 
-		if mean_mess_ratio >= 0.2 || early_stop_count >= max_chunk_gave_up {
-			// A soft failure: this candidate and its similar code pages are out.
-			for other in detect_similar(name) {
-				if soft_skip_count < len(soft_skip) && !detect_name_in(soft_skip[:soft_skip_count], other) {
-					soft_skip[soft_skip_count] = other
-					soft_skip_count += 1
-				}
-			}
-			if (name == "ascii" || name == "utf_8" || (specified != "" && name == specified)) && !lazy_str_hard_failure {
-				// The payload is decoded in full before a fallback is kept, and
-				// its chaos is the *threshold*, not the measurement
-				// (api.py:506-551).
-				if !has_decoded {
-					if !detect_bytes_are_defined(name, content[body_offset:]) {
-						continue
-					}
-					decoded_length = length
-					has_decoded = true
-				}
-				entry := Detect_Match{
-					encoding = name,
-					chaos    = 0.2,
-					bom      = bom_or_sig_available,
-					str_len  = decoded_length,
-				}
-				if specified != "" && name == specified {
-					fallbacks.specified = entry
-					fallbacks.has_spec = true
-				} else if name == "ascii" {
-					fallbacks.ascii = entry
-					fallbacks.has_ascii = true
-				} else {
-					fallbacks.utf8 = entry
-					fallbacks.has_utf8 = true
-				}
-			}
+		if mean_mess_ratio >= 0.2 || early_stop_count >= plan.max_chunk_gave_up {
+			// A soft failure: this candidate and its similar code pages are out
+			// (detect_record_soft_failure).
+			detect_record_soft_failure(
+				name,
+				specified,
+				probe.lazy_str_hard_failure,
+				preamble.bom_or_sig_available,
+				content,
+				preamble.body_offset,
+				length,
+				&decoded_length,
+				&has_decoded,
+				&soft_skip,
+				&soft_skip_count,
+				&fallbacks,
+			)
 			continue
 		}
 
@@ -531,42 +329,20 @@ detect_matches :: proc(content: string, allocator: mem.Allocator) -> Detect_Resu
 		targets := detect_targets(name)
 
 		// The coherence pass, chunk by chunk; `ascii` is skipped
-		// (api.py:603-619).
-		coherence_entries: [DETECT_COHERENCE_SLOTS]Detect_Coherence
-		coherence_count := 0
-		if name != "ascii" {
-			for chunk_index in 0 ..< chunk_count {
-				entries := detect_coherence_ratio(chunks[chunk_index], 0.1, targets, allocator)
-				for entry in entries {
-					if coherence_count < len(coherence_entries) {
-						coherence_entries[coherence_count] = entry
-						coherence_count += 1
-					}
-				}
-				delete(entries)
-			}
-		}
-		coherence := detect_coherence(coherence_entries[:coherence_count])
+		// (api.py:603-619) and the per-chunk entries are merged the way
+		// `merge_coherence_ratios` merges them (detect_chunk_coherence).
+		coherence := detect_chunk_coherence(name, chunks[:chunk_count], targets, allocator)
 
 		// `str(match)`, as a hash: the key `CharsetMatches.append` folds equal
 		// readings by (`len(item.raw) < TOO_BIG_SEQUENCE` gates the folding).
-		fingerprint: u64
-		if length < DETECT_TOO_BIG_SEQUENCE {
-			if kind == .Single_Byte {
-				if entry, class := charset_entry(name); class == .Text {
-					fingerprint = detect_fingerprint_single_byte(entry, content)
-				}
-			} else {
-				fingerprint = detect_fingerprint_text(decoded)
-			}
-		}
+		fingerprint := detect_candidate_fingerprint(name, kind, content, decoded, length)
 
 		match := Detect_Match{
 			encoding    = name,
 			chaos       = mean_mess_ratio,
 			coherence   = coherence,
 			str_len     = decoded_length,
-			bom         = bom_or_sig_available,
+			bom         = preamble.bom_or_sig_available,
 			fingerprint = fingerprint,
 		}
 		detect_keep_match(&results, &results_count, &kept, &kept_count, name, match, length)
@@ -639,7 +415,533 @@ detect_matches :: proc(content: string, allocator: mem.Allocator) -> Detect_Resu
 		}
 	}
 
-	if results_count == 0 {
+	return detect_finish_matches(&results, results_count, fallbacks, length)
+}
+// The candidate loop's phases, each reachable only from `detect_matches`.  The
+// extraction is stylistic (backlog M8): the port's one-to-one rule survives
+// line for line, every helper body is the code that used to sit inline.
+
+// detect_empty_payload_result is `from_bytes(b"")` (api.py:94-99): one utf_8
+// match with a chaos of 0.0, and nothing else.
+@(private)
+detect_empty_payload_result :: proc() -> Detect_Results {
+	result: Detect_Results
+	result.count = 1
+	result.items[0] = Detect_Match{encoding = "utf_8"}
+	return result
+}
+
+// detect_bom_encoding_answer is the `utf_16`/`utf_32` BOM verdict: a `utf_16`
+// or `utf_32` BOM decides the answer outright where the payload after it has
+// that codec's own shape, and the port has no decoder for either: the
+// reference decodes such a payload with the mark's codec and returns
+// `results[sig_encoding]` — the search ends there — as soon as that candidate
+// passes its chaos probe, which a payload whose length is a whole number of
+// code units is the case for.  What the port cannot reproduce is the
+// *measurement* (the chaos and coherence of the decoded reading), so the
+// match it answers with carries none; what it must not do is fall through to
+// the single-byte candidates, which is where a `utf_16` body would otherwise
+// land.  `utf_7` and gb18030's SIG are *not* treated this way: their codecs
+// fail on payloads the reference hands them in practice (a `+/v8` mark
+// followed by ASCII text is `ascii` to the reference, not `utf_7`), so those
+// two stay part of the decoder gap and the loop skips them.
+@(private)
+detect_bom_encoding_answer :: proc(sig_encoding: string, sig_length: int, length: int) -> (match: Detect_Match, decided: bool) {
+	if sig_encoding != "utf_16" && sig_encoding != "utf_32" {
+		return match, false
+	}
+	unit := sig_encoding == "utf_16" ? 2 : 4
+	if (length - sig_length) % unit == 0 {
+		return Detect_Match{encoding = sig_encoding, bom = true}, true
+	}
+	return match, false
+}
+
+// detect_prioritized_hints is `prioritized_encodings` (api.py:153-228): a
+// charset declared *inside* the payload is the first entry, a BOM/SIG is
+// inserted before it, `ascii` follows and `utf_8` joins them last unless one of
+// the earlier entries already is it.
+@(private)
+detect_prioritized_hints :: proc(sig_encoding: string, specified: string) -> (prioritized: [8]string, count: int) {
+	if sig_encoding != "" {
+		prioritized[count] = sig_encoding
+		count += 1
+	}
+	if specified != "" {
+		prioritized[count] = specified
+		count += 1
+	}
+	prioritized[count] = "ascii"
+	count += 1
+	if !detect_name_in(prioritized[:count], "utf_8") {
+		prioritized[count] = "utf_8"
+		count += 1
+	}
+	return
+}
+
+// Detect_Chunk_Plan is what the candidate loop slices a payload with: the
+// `steps`/`chunk_size` pair `from_bytes`' defaults imply, the
+// `TOO_BIG_SEQUENCE` class, the offsets `cut_sequence_chunks` yields, the
+// give-up budget they set, and the scratch room the decoded chunks need.
+@(private)
+Detect_Chunk_Plan :: struct {
+	steps:             int,
+	chunk_size:        int,
+	is_too_large:      bool,
+	offsets:           [DETECT_CHUNK_CAPACITY]int,
+	offset_count:      int,
+	max_chunk_gave_up: int,
+	chunk_room:        int,
+}
+
+// detect_chunk_plan is the candidate loop's sizing phase, in the reference's
+// own order: `from_bytes` asks the 5 `steps` of `chunk_size` 512 that
+// detect_matches' doc comment records, collapses them to a single full-length
+// chunk for a payload at or under that budget, and shrinks the chunk size so
+// that `steps` of them cover the payload.  `is_too_large` is the
+// `TOO_BIG_SEQUENCE` class.  The offsets are `cut_sequence_chunks`':
+// `range(0 if not bom else len(sig), length, int(length / steps))`
+// (api.py:386-390), the give-up budget is a quarter of them — at least two —
+// and the scratch room is what every offset's own chunk needs (see the scratch
+// allocation in detect_matches).
+@(private)
+detect_chunk_plan :: proc(length: int, has_sig: bool, sig_length: int) -> Detect_Chunk_Plan {
+	plan := Detect_Chunk_Plan{steps = 5, chunk_size = 512}
+	if length <= plan.chunk_size * plan.steps {
+		plan.steps = 1
+		plan.chunk_size = length
+	}
+	if plan.steps > 1 && length / plan.steps < plan.chunk_size {
+		plan.chunk_size = length / plan.steps
+	}
+	plan.is_too_large = length >= DETECT_TOO_BIG_SEQUENCE
+
+	offset_step := length / plan.steps
+	offset_start := 0
+	if has_sig {
+		offset_start = sig_length
+	}
+	for offset := offset_start; offset < length; offset += offset_step {
+		if plan.offset_count >= len(plan.offsets) {
+			break
+		}
+		plan.offsets[plan.offset_count] = offset
+		plan.offset_count += 1
+	}
+	plan.max_chunk_gave_up = plan.offset_count / 4
+	if plan.max_chunk_gave_up < 2 {
+		plan.max_chunk_gave_up = 2
+	}
+	for offset_index in 0 ..< plan.offset_count {
+		plan.chunk_room += min(plan.chunk_size, length - plan.offsets[offset_index])
+	}
+	return plan
+}
+
+// detect_candidate_at is the candidate at `candidate_index` in `best()`'s
+// order: the payload's own hints first (`prioritized_encodings`, in the order
+// detect_prioritized_hints built them), each carrying its
+// `is_multi_byte_encoding` and the port's decoder class, then the fixed
+// candidate table.
+@(private)
+detect_candidate_at :: proc(candidate_index: int, prioritized: []string) -> (name: string, multi_byte: bool, kind: Detect_Port_Kind) {
+	kind = .Unsupported
+	if candidate_index < len(prioritized) {
+		name = prioritized[candidate_index]
+		multi_byte, kind = detect_candidate_class(name)
+	} else {
+		candidate := DETECT_CANDIDATES[candidate_index - len(prioritized)]
+		name = candidate.name
+		multi_byte = candidate.multi_byte
+		kind = candidate.kind
+	}
+	return
+}
+
+// Detect_Preamble is one candidate's admission decision and the byte window its
+// decoding starts from.
+@(private)
+Detect_Preamble :: struct {
+	skip:                 bool,
+	bom_or_sig_available: bool,
+	strip_sig_or_bom:     bool,
+	body_offset:          int,
+}
+
+// detect_candidate_preamble is the reference's skip cascade for one candidate,
+// in its own order: an already-tested name is dropped; a name that survives is
+// recorded as tested *before* the remaining checks, because the `_in(tested)`
+// conditions later in the loop read that bookkeeping; a codec that only a mark
+// can admit (`utf_16`, `utf_32`, `utf_7`) is dropped unless the payload carries
+// its mark; a code page whose similar-name failure already fired is dropped
+// (`soft_skip`); `is_multi_byte_encoding`'s decoder probe and the decode that
+// follows both fail for a code page this port has no table for — the
+// reference's hard failure, not a skip it can recover from; and once a
+// definitive match is in hand only candidates of an intersecting language —
+// and at most `POST_DEFINITIVE_SB_CAP` further single-byte ones — keep going.
+// A codec that only a mark can admit also fixes `strip_sig_or_bom`, the
+// reference's `should_strip_sig_or_bom`: `utf_16`/`utf_32` keep their mark,
+// everything else decodes from behind it (`body_offset`).
+@(private)
+detect_candidate_preamble :: proc(
+	name: string,
+	kind: Detect_Port_Kind,
+	multi_byte: bool,
+	sig_encoding: string,
+	sig_length: int,
+	definitive_match_found: bool,
+	definitive_target_languages: []string,
+	post_definitive_sb_success_count: int,
+	tested: ^[DETECT_MATCH_CAPACITY]string,
+	tested_count: ^int,
+	soft_skip: []string,
+) -> Detect_Preamble {
+	// The reference's own cap on how many further single-byte candidates a
+	// definitive match tolerates (documented in the definitive-mode comment
+	// further down the loop).
+	POST_DEFINITIVE_SB_CAP :: 7
+	preamble: Detect_Preamble
+	if detect_name_in(tested[:tested_count^], name) {
+		preamble.skip = true
+		return preamble
+	}
+	tested[tested_count^] = name
+	tested_count^ += 1
+
+	preamble.bom_or_sig_available = sig_encoding != "" && sig_encoding == name
+	preamble.strip_sig_or_bom = preamble.bom_or_sig_available && name != "utf_16" && name != "utf_32"
+	preamble.body_offset = preamble.strip_sig_or_bom ? sig_length : 0
+
+	if (name == "utf_16" || name == "utf_32") && !preamble.bom_or_sig_available {
+		preamble.skip = true
+		return preamble
+	}
+	if name == "utf_7" && !preamble.bom_or_sig_available {
+		preamble.skip = true
+		return preamble
+	}
+	if detect_name_in(soft_skip, name) {
+		preamble.skip = true
+		return preamble
+	}
+	if kind == .Unsupported {
+		preamble.skip = true
+		return preamble
+	}
+	if definitive_match_found {
+		if !detect_languages_intersect(detect_targets(name), definitive_target_languages) {
+			preamble.skip = true
+			return preamble
+		}
+	}
+	if definitive_match_found && !multi_byte && post_definitive_sb_success_count >= POST_DEFINITIVE_SB_CAP {
+		preamble.skip = true
+		return preamble
+	}
+	return preamble
+}
+
+// Detect_Chunk_Probe is one candidate's sliced chunks, the early-stop count
+// they start with, and the two hard-failure flavours the loop consults.
+@(private)
+Detect_Chunk_Probe :: struct {
+	chunks:                [DETECT_CHUNK_CAPACITY]string,
+	chunk_count:           int,
+	early_stop_count:      int,
+	hard_failure:          bool,
+	lazy_str_hard_failure: bool,
+}
+
+// detect_slice_candidate_chunks picks `cut_sequence_chunks`' branch for the
+// candidate's own decoder (utils.py:394-452): a multibyte candidate is sliced
+// byte-wise, a single-byte one is sliced per offset and decoded strictly.
+@(private)
+detect_slice_candidate_chunks :: proc(
+	content: string,
+	name: string,
+	multi_byte: bool,
+	deferred_decoding: bool,
+	length: int,
+	sig_length: int,
+	bom_or_sig_available: bool,
+	strip_sig_or_bom: bool,
+	decoded: string,
+	has_decoded: bool,
+	decoded_length: int,
+	plan: Detect_Chunk_Plan,
+	scratch: []u8,
+) -> Detect_Chunk_Probe {
+	if multi_byte {
+		return detect_slice_multibyte_chunks(content, length, sig_length, bom_or_sig_available, strip_sig_or_bom, decoded, has_decoded, decoded_length, plan, scratch)
+	}
+	return detect_slice_single_byte_chunks(content, name, deferred_decoding, length, plan, scratch)
+}
+
+// detect_slice_multibyte_chunks is `cut_sequence_chunks`' byte-slicing branch
+// for a multibyte decoder (utils.py:401-452): the raw slice read with
+// `errors="ignore"`, plus the bad-cut adjustment when a slice starts
+// mid-sequence.
+@(private)
+detect_slice_multibyte_chunks :: proc(
+	content: string,
+	length: int,
+	sig_length: int,
+	bom_or_sig_available: bool,
+	strip_sig_or_bom: bool,
+	decoded: string,
+	has_decoded: bool,
+	decoded_length: int,
+	plan: Detect_Chunk_Plan,
+	scratch: []u8,
+) -> Detect_Chunk_Probe {
+	probe: Detect_Chunk_Probe
+	cursor := 0
+	for offset_index in 0 ..< plan.offset_count {
+		if probe.chunk_count >= len(probe.chunks) {
+			break
+		}
+		offset := plan.offsets[offset_index]
+		chunk_end := offset + plan.chunk_size
+		if chunk_end > length + 8 {
+			continue
+		}
+		cut_end := min(chunk_end, length)
+		cut := content[offset:cut_end]
+		if bom_or_sig_available && !strip_sig_or_bom {
+			cut, _ = strings.concatenate({content[:sig_length], cut}, context.temp_allocator)
+		}
+		chunk, _ := detect_write_utf8_ignore(cut, scratch[cursor:])
+		if offset > 0 && has_decoded {
+			partial := min(min(plan.chunk_size, 16), len(chunk))
+			prefix := chunk[:partial]
+			expected_offset := offset * decoded_length / length
+			search_start := max(0, expected_offset - 32768)
+			search_end := min(decoded_length, expected_offset + 32768)
+			_, found_nearby := detect_find(decoded, prefix, search_start, search_end)
+			_, in_payload := detect_find(decoded, prefix, 0, len(decoded))
+			if !found_nearby && !in_payload {
+				for previous := offset; previous > offset - 4 && previous >= 0; previous -= 1 {
+					retry_cut := content[previous:cut_end]
+					if bom_or_sig_available && !strip_sig_or_bom {
+						retry_cut, _ = strings.concatenate({content[:sig_length], retry_cut}, context.temp_allocator)
+					}
+					retry_chunk, _ := detect_write_utf8_ignore(retry_cut, scratch[cursor:])
+					retry_partial := min(min(plan.chunk_size, 16), len(retry_chunk))
+					if _, ok := detect_find(decoded, retry_chunk[:retry_partial], 0, len(decoded)); ok {
+						chunk = retry_chunk
+						break
+					}
+				}
+			}
+		}
+		probe.chunks[probe.chunk_count] = chunk
+		probe.chunk_count += 1
+		cursor += len(chunk)
+	}
+	return probe
+}
+
+// detect_slice_single_byte_chunks is the deferred (regular-size) and
+// eager-truncated (huge) single-byte probing: raw slices decoded strictly, one
+// byte per character.  A chunk that does not decode ends the walk — a hard
+// failure when the decoding was deferred, and `lazy_str_hard_failure` when the
+// payload is huge (api.py:445-468).
+@(private)
+detect_slice_single_byte_chunks :: proc(
+	content: string,
+	name: string,
+	deferred_decoding: bool,
+	length: int,
+	plan: Detect_Chunk_Plan,
+	scratch: []u8,
+) -> Detect_Chunk_Probe {
+	probe: Detect_Chunk_Probe
+	cursor := 0
+	for offset_index in 0 ..< plan.offset_count {
+		if probe.chunk_count >= len(probe.chunks) {
+			break
+		}
+		offset := plan.offsets[offset_index]
+		chunk_end := offset + plan.chunk_size
+		// The trailing-slice guard is the *byte-slicing* branch's
+		// (utils.py:401-403).  A deferred single-byte candidate slices
+		// `sequences[i:i + chunk_size]` with no such guard
+		// (utils.py:394-396), so its last offset — `int(length / steps)`
+		// short of the end — still yields the tail of the payload, one
+		// or more bytes of it, and that short chunk is measured with the
+		// rest: a 2561-byte payload's candidate is the mean of six
+		// chunks, five of 512 bytes and one of one byte.
+		if !deferred_decoding && chunk_end > length + 8 {
+			continue
+		}
+		cut := content[offset:min(chunk_end, length)]
+		if len(cut) == 0 {
+			break
+		}
+		chunk, ok := detect_write_single_byte(name, cut, scratch[cursor:])
+		if !ok {
+			if deferred_decoding {
+				// Identical outcome and bookkeeping to the whole-payload
+				// decode failing: the candidate is out.
+				probe.hard_failure = true
+			} else {
+				probe.early_stop_count = plan.max_chunk_gave_up
+				probe.lazy_str_hard_failure = true
+			}
+			break
+		}
+		probe.chunks[probe.chunk_count] = chunk
+		probe.chunk_count += 1
+		cursor += len(chunk)
+	}
+	return probe
+}
+
+// detect_measure_chunks is `sum(md_ratios) / len(md_ratios)`, summed in the
+// reference's order, together with the early stop that ends the walk once
+// enough chunks have failed the 0.2 threshold — or at once, for a payload
+// whose mark the decoder is not asked to strip.
+@(private)
+detect_measure_chunks :: proc(chunks: []string, early_stop_count_in: int, max_chunk_gave_up: int, stop_early: bool) -> (mean: f64, early_stop_count: int) {
+	ratios: [DETECT_CHUNK_CAPACITY]f64
+	ratio_count := 0
+	early_stop_count = early_stop_count_in
+	for chunk in chunks {
+		ratio := detect_mess_ratio(chunk, 0.2)
+		ratios[ratio_count] = ratio
+		ratio_count += 1
+		if ratio >= 0.2 {
+			early_stop_count += 1
+		}
+		if early_stop_count >= max_chunk_gave_up || stop_early {
+			break
+		}
+	}
+	if ratio_count > 0 {
+		sum := 0.0
+		for ratio_index in 0 ..< ratio_count {
+			sum += ratios[ratio_index]
+		}
+		mean = sum / f64(ratio_count)
+	}
+	return
+}
+
+// detect_huge_candidate_tail_is_defined is the huge single-byte payload's tail
+// check (api.py:474-491): the reading is thrown away by the reference too, so
+// the 50000-byte-and-beyond window is validated byte by byte.
+@(private)
+detect_huge_candidate_tail_is_defined :: proc(content: string, name: string) -> bool {
+	return detect_bytes_are_defined(name, content[50000:])
+}
+
+// detect_record_soft_failure records a candidate the mean mess ratio or the
+// early stop put out (api.py:506-551): the candidate and every code page
+// `similar_encodings` names become `soft_skip`s, and a payload that is `ascii`,
+// `utf_8` or the payload's own declared charset is decoded in full before its
+// fallback entry is kept — its chaos is the *threshold*, not the measurement.
+@(private)
+detect_record_soft_failure :: proc(
+	name: string,
+	specified: string,
+	lazy_str_hard_failure: bool,
+	bom_or_sig_available: bool,
+	content: string,
+	body_offset: int,
+	length: int,
+	decoded_length: ^int,
+	has_decoded: ^bool,
+	soft_skip: ^[DETECT_MATCH_CAPACITY]string,
+	soft_skip_count: ^int,
+	fallbacks: ^Detect_Fallbacks,
+) {
+	// A soft failure: this candidate and its similar code pages are out.
+	for other in detect_similar(name) {
+		if soft_skip_count^ < len(soft_skip) && !detect_name_in(soft_skip[:soft_skip_count^], other) {
+			soft_skip[soft_skip_count^] = other
+			soft_skip_count^ += 1
+		}
+	}
+	if (name == "ascii" || name == "utf_8" || (specified != "" && name == specified)) && !lazy_str_hard_failure {
+		// The payload is decoded in full before a fallback is kept, and
+		// its chaos is the *threshold*, not the measurement
+		// (api.py:506-551).
+		if !has_decoded^ {
+			if !detect_bytes_are_defined(name, content[body_offset:]) {
+				return
+			}
+			decoded_length^ = length
+			has_decoded^ = true
+		}
+		entry := Detect_Match{
+			encoding = name,
+			chaos    = 0.2,
+			bom      = bom_or_sig_available,
+			str_len  = decoded_length^,
+		}
+		if specified != "" && name == specified {
+			fallbacks.specified = entry
+			fallbacks.has_spec = true
+		} else if name == "ascii" {
+			fallbacks.ascii = entry
+			fallbacks.has_ascii = true
+		} else {
+			fallbacks.utf8 = entry
+			fallbacks.has_utf8 = true
+		}
+	}
+}
+
+// detect_chunk_coherence is the coherence pass, chunk by chunk; `ascii` is
+// skipped (api.py:603-619) and the per-chunk entries are merged the way
+// `merge_coherence_ratios` merges them.
+@(private)
+detect_chunk_coherence :: proc(name: string, chunks: []string, targets: []string, allocator: mem.Allocator) -> f64 {
+	coherence_entries: [DETECT_COHERENCE_SLOTS]Detect_Coherence
+	coherence_count := 0
+	if name != "ascii" {
+		for chunk in chunks {
+			entries := detect_coherence_ratio(chunk, 0.1, targets, allocator)
+			for entry in entries {
+				if coherence_count < len(coherence_entries) {
+					coherence_entries[coherence_count] = entry
+					coherence_count += 1
+				}
+			}
+			delete(entries)
+		}
+	}
+	return detect_coherence(coherence_entries[:coherence_count])
+}
+
+// detect_candidate_fingerprint is `str(match)`, as a hash: the key
+// `CharsetMatches.append` folds equal readings by (`len(item.raw) <
+// TOO_BIG_SEQUENCE` gates the folding).
+@(private)
+detect_candidate_fingerprint :: proc(name: string, kind: Detect_Port_Kind, content: string, decoded: string, length: int) -> u64 {
+	fingerprint: u64
+	if length < DETECT_TOO_BIG_SEQUENCE {
+		if kind == .Single_Byte {
+			if entry, class := charset_entry(name); class == .Text {
+				fingerprint = detect_fingerprint_single_byte(entry, content)
+			}
+		} else {
+			fingerprint = detect_fingerprint_text(decoded)
+		}
+	}
+	return fingerprint
+}
+
+// detect_finish_matches is the candidate loop's epilogue (api.py:766-792): with
+// no surviving candidate the fallbacks answer in httpie's own order — the
+// payload's declared charset first, then utf_8, then ascii — and the kept
+// candidates come back in `best()`'s order (detect_sort).
+@(private)
+detect_finish_matches :: proc(results: ^[DETECT_MATCH_CAPACITY]Detect_Match, results_count: int, fallbacks: Detect_Fallbacks, length: int) -> Detect_Results {
+	result: Detect_Results
+	count := results_count
+	if count == 0 {
 		// api.py:766-792: the specified encoding first, then utf_8, then ascii.
 		found := false
 		entry := Detect_Match{}
@@ -656,14 +958,13 @@ detect_matches :: proc(content: string, allocator: mem.Allocator) -> Detect_Resu
 		}
 		if found {
 			results[0] = entry
-			results_count = 1
+			count = 1
 		}
 	}
-
-	for index in 0 ..< results_count {
+	for index in 0 ..< count {
 		result.items[index] = results[index]
 	}
-	result.count = results_count
+	result.count = count
 	detect_sort(result.items[:result.count], length)
 	return result
 }

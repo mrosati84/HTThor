@@ -1233,7 +1233,15 @@ session_seed_in_host_dir :: proc(
 		return
 	}
 	path := fmt.aprintf("%s/%s", directory, name, allocator = context.temp_allocator)
-	testing.expectf(t, os.write_entire_file_from_bytes(path, data) == nil, "cannot seed %s", path)
+	// Seeded 0600, like every file the port writes (session.SESSION_FILE_MODE):
+	// the load path reports and tightens a file others can read (backlog M4),
+	// and a test about session *contents* wants nothing to do with that.
+	testing.expectf(
+		t,
+		os.write_entire_file_from_bytes(path, data, session.SESSION_FILE_MODE) == nil,
+		"cannot seed %s",
+		path,
+	)
 }
 
 // A pre-3.2 session file (an object `headers` store) is still read, and httpie
@@ -1323,7 +1331,11 @@ session_seed_legacy :: proc(t: ^testing.T, sandbox: string, name: string, conten
 	path := fmt.aprintf("%s/%s", directory, name, allocator = context.temp_allocator)
 	testing.expectf(
 		t,
-		os.write_entire_file_from_bytes(path, transmute([]u8)contents) == nil,
+		os.write_entire_file_from_bytes(
+			path,
+			transmute([]u8)contents,
+			session.SESSION_FILE_MODE,
+		) == nil,
 		"cannot seed %s",
 		path,
 	)

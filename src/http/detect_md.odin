@@ -56,12 +56,6 @@ detect_char_info :: proc(cp: rune) -> Detect_Info {
 	return DETECT_RUNS[low - 1]
 }
 
-// detect_char_range is `unicode_range(character)`: the range *name*, "" for the
-// `None` a code point outside every range gets.
-detect_char_range :: proc(info: Detect_Info) -> string {
-	return DETECT_RANGE_NAMES[info.range]
-}
-
 // detect_is_basic_latin is the `unicode_range_a == "Basic Latin"` test
 // `is_suspiciously_successive_range` makes by name.
 @(private)
@@ -632,29 +626,6 @@ detect_next_rune :: proc(sequence: string, index: ^int) -> rune {
 	}
 	index^ += size
 	return character
-}
-
-// detect_rune_slice is `decoded[start:stop]` for a Python `str`: a slice by
-// *code point* index, returned as the byte span those code points cover.
-detect_rune_slice :: proc(sequence: string, start, stop: int) -> string {
-	index := 0
-	count := 0
-	begin := -1
-	for index < len(sequence) && count < stop {
-		if count == start {
-			begin = index
-		}
-		_, size := utf8.decode_rune_in_string(sequence[index:])
-		if size <= 0 {
-			size = 1
-		}
-		index += size
-		count += 1
-	}
-	if begin < 0 {
-		return ""
-	}
-	return sequence[begin:index]
 }
 
 // detect_rune_count is `len(decoded_sequence)` for a Python `str`.

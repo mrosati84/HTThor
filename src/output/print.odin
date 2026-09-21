@@ -1,25 +1,46 @@
 // Package output renders everything the user sees: the version line, the usage
 // text, errors, and the request/response blocks.
 //
-// The scaffold prints the shapes the skeleton can actually produce (a request
-// head for --offline, a response head and raw body). The parity renderer —
-// --print masks, pretty JSON, ANSI styles, downloads — is t_9a017f57's; it
-// replaces these procs without changing the package boundary: everything here
-// writes to an io.Writer it is handed, and allocates nothing.
+// The parity renderer — --print masks, pretty JSON, ANSI styles, downloads —
+// lives in render.odin and owns every request/response shape it prints. What
+// remains here is the scaffold's own printing: the version string, the usage
+// line `print_help` falls back to, and the one-line errors. The package
+// boundary is unchanged — everything here writes to an io.Writer it is handed,
+// and allocates nothing.
 package output
 
 import "core:fmt"
 import "core:io"
-
-import "src:http"
 
 // VERSION is the reference release this port must match byte for byte: the
 // `--version` action prints the bare version string and nothing else
 // (argparse's `action='version'`, httpie/cli/definition.py:923).
 VERSION :: "3.2.4"
 
+// PORT_VERSION is this port's own release: the one CHANGELOG.md names and a bug
+// report should quote. The reference's line above is printed first and verbatim;
+// this is a deliberate second line, because a binary that prints only `3.2.4`
+// cannot be told apart from the upstream release it ports (backlog M9, README
+// "Status and limitations").
+PORT_VERSION :: "0.1.0"
+
+// PORT_REVISION is the tree the binary was built from, handed in by the Makefile
+// (`-define:PORT_REVISION=...`). It is empty for a build that did not name one —
+// a plain `odin build src`, the test binary — and the line then stops at the
+// release. `git describe --always --dirty` is what the Makefile passes, so a
+// build from a modified tree says so.
+PORT_REVISION :: #config(PORT_REVISION, "")
+
+// print_version writes the reference's version line, then the port's own
+// identity: `--version` is the one action a bug report quotes, and the revision
+// it came from has to be nameable (backlog M9).
 print_version :: proc(w: io.Writer) {
 	fmt.wprintfln(w, "%s", VERSION)
+	if PORT_REVISION == "" {
+		fmt.wprintfln(w, "htthor %s", PORT_VERSION)
+		return
+	}
+	fmt.wprintfln(w, "htthor %s (%s)", PORT_VERSION, PORT_REVISION)
 }
 
 print_help :: proc(w: io.Writer, program_name: string) {
@@ -34,54 +55,4 @@ print_help :: proc(w: io.Writer, program_name: string) {
 // name; docs/PARITY.md pins the exact wording and stream.
 print_error :: proc(w: io.Writer, program_name: string, message: string) {
 	fmt.wprintfln(w, "%s: error: %s", program_name, message)
-}
-
-// print_request_head renders the request line and headers for --offline: the
-// request that would go on the wire, without sending it. Serialising the query
-// string and the body is the engine's job (t_3d62ca31); this renders the target
-// the scaffold already parsed.
-//
-// The `Host` line is the authority the URL spells — the request's host plus
-// `:<port>` whenever the URL spelled a port whose value is not zero, an explicit
-// scheme default included (`http.host_header_value`, docs/PARITY.md §3.6).
-print_request_head :: proc(w: io.Writer, req: ^http.Request) {
-	fmt.wprintfln(w, "%s %s HTTP/1.1", http.method_to_string(req.method), req.path)
-
-	if req.port != 0 {
-		fmt.wprintfln(w, "Host: %s:%d", req.host, req.port)
-	} else {
-		fmt.wprintfln(w, "Host: %s", req.host)
-	}
-	for header in req.headers {
-		fmt.wprintfln(w, "%s: %s", header.name, header.value)
-	}
-	io.write_string(w, "\n")
-}
-
-// print_response writes the status line, the headers and the body verbatim.
-// Pretty printing and --print masks replace this in t_9a017f57.
-print_response :: proc(w: io.Writer, res: ^http.Response) {
-	version := res.http_version != "" ? res.http_version : "HTTP/1.1"
-	fmt.wprintfln(w, "%s %d %s", version, res.status, res.reason)
-	for header in res.headers {
-		fmt.wprintfln(w, "%s: %s", header.name, header.value)
-	}
-	io.write_string(w, "\n")
-	print_body(w, res)
-}
-
-// print_body writes the response bytes as received; it does not interpret them.
-print_body :: proc(w: io.Writer, res: ^http.Response) -> (int, io.Error) {
-	if len(res.body) == 0 {
-		return 0, .None
-	}
-	written, write_err := io.write(w, res.body)
-	if write_err != .None {
-		return written, write_err
-	}
-	if res.body[len(res.body) - 1] != '\n' {
-		n, newline_err := io.write_string(w, "\n")
-		return written + n, newline_err
-	}
-	return written, .None
 }
