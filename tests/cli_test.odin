@@ -810,6 +810,164 @@ test_parse_args_short_option_clusters_do_not_leak :: proc(t: ^testing.T) {
 	expect_no_leaks(t, &track)
 }
 
+// The blanket `--no-OPTION` form the help text promises ("for every `--OPTION`
+// there is also a `--no-OPTION`") is `_apply_no_options`
+// (httpie/cli/argparser.py:357-378): for each `--no-OPTION` argparse could not
+// resolve as an option, the inverted name `'--' + option[5:]` has to be one of
+// some action's option strings, and that action's dest goes back to its
+// default. The inverted name therefore carries the `--` prefix the option table
+// spells its own names with, which is the form the port has to build.
+@(test)
+test_parse_args_blanket_no_option_form_resets_flags :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	options, err := parse_cli(
+		[]string{
+			"oj",
+			"--offline",
+			"--follow",
+			"--check-status",
+			"--style=dracula",
+			"--no-offline",
+			"--no-follow",
+			"--no-check-status",
+			"--no-style",
+			"example.com",
+		},
+		allocator,
+	)
+	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
+	testing.expect(t, !options.offline, "--no-offline puts --offline back to false")
+	testing.expect(t, !options.follow, "--no-follow puts --follow back to false")
+	testing.expect(t, !options.check_status, "--no-check-status puts --check-status back to false")
+	testing.expect_value(t, options.style, "auto")
+	testing.expect(t, !options.style_given, "--no-style puts --style back to its default")
+	cli.options_destroy(&options)
+
+	// An inverted name that is no action's option string stays an extra, and
+	// is reported by the same `invalid` list.
+	_, bogus := parse_cli([]string{"oj", "--offline", "--no-bogus", "example.com"}, allocator)
+	testing.expect_value(t, bogus.kind, cli.Parse_Error_Kind.Usage)
+	testing.expectf(
+		t,
+		strings.contains(bogus.message, "unrecognized arguments: --no-bogus"),
+		"unexpected message: %s",
+		bogus.message,
+	)
+	cli.parse_error_destroy(&bogus)
+
+	expect_no_leaks(t, &track)
+}
+
+// A `--no-OPTION` over an option that takes a value puts that dest back to the
+// value a fresh parse starts from — argparse's `action.default` — including the
+// `*_given` flag the port keeps beside the value.
+@(test)
+test_parse_args_no_option_resets_value_dests :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	// the same command line without the `--no-` forms: every dest is away from
+	// its default, which is what makes the reset below observable
+	gone, gone_err := parse_cli(
+		[]string{
+			"oj",
+			"--timeout=5",
+			"--max-redirects=7",
+			"--pretty=none",
+			"--style=dracula",
+			"example.com",
+		},
+		allocator,
+	)
+	testing.expect_value(t, gone_err.kind, cli.Parse_Error_Kind.None)
+	testing.expect_value(t, gone.timeout_s, 5)
+	testing.expect(t, gone.timeout_given, "--timeout was given")
+	testing.expect_value(t, gone.max_redirects, 7)
+	testing.expect_value(t, gone.pretty, cli.Pretty.None)
+	testing.expect_value(t, gone.style, "dracula")
+
+	reset, reset_err := parse_cli(
+		[]string{
+			"oj",
+			"--timeout=5",
+			"--max-redirects=7",
+			"--pretty=none",
+			"--style=dracula",
+			"--no-timeout",
+			"--no-max-redirects",
+			"--no-pretty",
+			"--no-style",
+			"example.com",
+		},
+		allocator,
+	)
+	testing.expect_value(t, reset_err.kind, cli.Parse_Error_Kind.None)
+
+	fresh, fresh_err := parse_cli([]string{"oj", "example.com"}, allocator)
+	testing.expect_value(t, fresh_err.kind, cli.Parse_Error_Kind.None)
+
+	testing.expect_value(t, reset.timeout_s, fresh.timeout_s)
+	testing.expect_value(t, reset.timeout_given, fresh.timeout_given)
+	testing.expect_value(t, reset.max_redirects, fresh.max_redirects)
+	testing.expect_value(t, reset.pretty, fresh.pretty)
+	testing.expect_value(t, reset.style, fresh.style)
+
+	cli.options_destroy(&gone)
+	cli.options_destroy(&reset)
+	cli.options_destroy(&fresh)
+	expect_no_leaks(t, &track)
+}
+
+// `--no-sorted`/`--no-unsorted` are not the blanket form at all: they are two
+// real entries in the table (httpie/cli/definition.py:319-324, hidden from the
+// docs with `help=Qualifiers.SUPPRESS`), so argparse resolves them as options
+// and they never reach `_apply_no_options`. Their own const is the inverted
+// format option — `--no-sorted` appends `unsorted` — which is what this pins.
+@(test)
+test_parse_args_literal_no_sorted_forms_still_apply :: proc(t: ^testing.T) {
+	backing := context.allocator
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, backing, backing)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	no_sorted, no_sorted_err := parse_cli([]string{"oj", "--no-sorted", "example.com"}, allocator)
+	testing.expect_value(t, no_sorted_err.kind, cli.Parse_Error_Kind.None)
+	testing.expect(t, !no_sorted.format_options.headers_sort, "--no-sorted asks for unsorted headers")
+	testing.expect(t, !no_sorted.format_options.json_sort_keys, "--no-sorted asks for unsorted keys")
+
+	// `--no-unsorted` on its own lands on the sorted defaults, so it is paired
+	// with `--unsorted` to show the literal really is applied: the groups fold
+	// in command-line order, and the last one wins.
+	no_unsorted, no_unsorted_err := parse_cli(
+		[]string{"oj", "--unsorted", "--no-unsorted", "example.com"},
+		allocator,
+	)
+	testing.expect_value(t, no_unsorted_err.kind, cli.Parse_Error_Kind.None)
+	testing.expect(
+		t,
+		no_unsorted.format_options.headers_sort,
+		"--no-unsorted wins over --unsorted: it asks for sorted headers",
+	)
+	testing.expect(
+		t,
+		no_unsorted.format_options.json_sort_keys,
+		"--no-unsorted wins over --unsorted: it asks for sorted keys",
+	)
+
+	cli.options_destroy(&no_sorted)
+	cli.options_destroy(&no_unsorted)
+	expect_no_leaks(t, &track)
+}
+
 // A malformed `config.json` is a *warning* in the reference, not a failure:
 // `Environment.config` catches `ConfigFileError` and logs it, and the run
 // carries on with `Config.DEFAULTS`' empty `default_options`
