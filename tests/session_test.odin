@@ -23,7 +23,7 @@ test_session_offline_renders_the_request_head :: proc(t: ^testing.T) {
 	err_out: strings.Builder
 	strings.builder_init(&err_out, allocator)
 
-	options, err := parse_cli_plain([]string{"oj", "--offline", "GET", "localhost:8000/hello"}, allocator)
+	options, err := parse_cli_plain([]string{"htthor", "--offline", "GET", "localhost:8000/hello"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
 
 	ctx := session.context_create(options, strings.to_writer(&out), strings.to_writer(&err_out))
@@ -58,7 +58,7 @@ test_session_version_and_help_need_no_url :: proc(t: ^testing.T) {
 		err_out: strings.Builder
 		strings.builder_init(&err_out, allocator)
 
-		options, err := parse_cli_plain([]string{"oj", flag}, allocator)
+		options, err := parse_cli_plain([]string{"htthor", flag}, allocator)
 		testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
 
 		ctx := session.context_create(options, strings.to_writer(&out), strings.to_writer(&err_out))
@@ -233,7 +233,7 @@ test_session_missing_url_is_a_usage_error :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	options, err := parse_cli_plain([]string{"oj"}, allocator)
+	options, err := parse_cli_plain([]string{"htthor"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.Usage)
 	testing.expectf(
 		t,
@@ -260,7 +260,7 @@ test_session_invalid_url_is_a_usage_error :: proc(t: ^testing.T) {
 	err_out: strings.Builder
 	strings.builder_init(&err_out, allocator)
 
-	options, err := parse_cli_plain([]string{"oj", "ftp://example.com/"}, allocator)
+	options, err := parse_cli_plain([]string{"htthor", "ftp://example.com/"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
 
 	ctx := session.context_create(options, strings.to_writer(&out), strings.to_writer(&err_out))
@@ -294,7 +294,7 @@ test_session_multipart_body_takes_multipart_data_only :: proc(t: ^testing.T) {
 	allocator := mem.tracking_allocator(&track)
 
 	head := [?]string{
-		"oj", "--offline", "--ignore-stdin", "--pretty=none", "-p", "B",
+		"htthor", "--offline", "--ignore-stdin", "--pretty=none", "-p", "B",
 		"--boundary=B",
 	}
 	tail := [?]string{"POST", "http://example.org/x"}

@@ -3,7 +3,7 @@
 //
 // The file's byte contract is the reference's own `save()`:
 // `json.dumps(..., indent=4, sort_keys=True, ensure_ascii=True)` plus one
-// newline. The tests below compare oj's file with the file the *reference* wrote
+// newline. The tests below compare htthor's file with the file the *reference* wrote
 // during the capture, kept in the tree at `tests/fixtures/sessions/`, so a
 // formatting drift fails here rather than only in the parity harness.
 //
@@ -34,7 +34,7 @@ SESSION_CAPTURE_DIR :: "tests/fixtures/sessions"
 // The `session-write` scenario
 // ---------------------------------------------------------------------------
 
-// The file oj writes for `--session=cap1` must be the reference's file, byte
+// The file htthor writes for `--session=cap1` must be the reference's file, byte
 // for byte: same key order (sort_keys puts `__meta__` first), same four-space
 // indentation, same trailing newline — and the same 0700 directory. The file
 // mode is the port's own 0600 rather than the reference's 0644: a deliberate
@@ -59,7 +59,7 @@ test_session_cap1_file_matches_the_reference_capture :: proc(t: ^testing.T) {
 	strings.builder_init(&err_out, allocator)
 
 	argv := []string{
-		"oj",
+		"htthor",
 		"--session=cap1",
 		"--offline",
 		"-p", "hb",
@@ -95,7 +95,7 @@ test_session_cap1_file_matches_the_reference_capture :: proc(t: ^testing.T) {
 		testing.expectf(
 			t,
 			string(written) == string(want),
-			"the session file differs from the reference's:\n--- reference\n%s\n--- oj\n%s",
+			"the session file differs from the reference's:\n--- reference\n%s\n--- htthor\n%s",
 			string(want),
 			string(written),
 		)
@@ -161,7 +161,7 @@ test_session_save_tightens_an_existing_0644_file :: proc(t: ^testing.T) {
 	strings.builder_init(&err_out, allocator)
 
 	// The same offline write the cap1 case makes, with the file already there
-	// and world-readable — the state a 3.2-era oj or httpie leaves behind.
+	// and world-readable — the state a 3.2-era htthor or httpie leaves behind.
 	session_seed(t, sandbox, "cap1.json", "cap1.json")
 	path := fmt.aprintf(
 		"%s/config/sessions/127.0.0.1_8765/cap1.json",
@@ -176,7 +176,7 @@ test_session_save_tightens_an_existing_0644_file :: proc(t: ^testing.T) {
 	)
 
 	argv := []string{
-		"oj",
+		"htthor",
 		"--session=cap1",
 		"--offline",
 		"-p", "hb",
@@ -242,7 +242,7 @@ test_session_read_only_reads_the_file_back :: proc(t: ^testing.T) {
 	)
 
 	argv := []string{
-		"oj",
+		"htthor",
 		"--session-read-only=cap1",
 		"--offline",
 		"-p", "H",
@@ -296,7 +296,7 @@ test_session_read_only_creates_a_missing_file :: proc(t: ^testing.T) {
 	strings.builder_init(&err_out, allocator)
 
 	argv := []string{
-		"oj",
+		"htthor",
 		"--session-read-only=never",
 		"--offline",
 		"-p", "h",
@@ -348,7 +348,7 @@ test_session_cookie_jar_replays_a_set_cookie :: proc(t: ^testing.T) {
 	session_seed(t, sandbox, "cap-cookie.json", "cap-cookie.json")
 
 	argv := []string{
-		"oj",
+		"htthor",
 		"--session=cap-cookie",
 		"--offline",
 		"-p", "h",
@@ -415,7 +415,7 @@ test_session_cookie_jar_replays_a_set_cookie :: proc(t: ^testing.T) {
 		testing.expectf(
 			t,
 			string(written) == string(want),
-			"the cookie file differs from the reference's:\n--- reference\n%s\n--- oj\n%s",
+			"the cookie file differs from the reference's:\n--- reference\n%s\n--- htthor\n%s",
 			string(want),
 			string(written),
 		)
@@ -475,7 +475,7 @@ test_session_renders_no_cookie_on_a_cross_host_hop :: proc(t: ^testing.T) {
 
 	url := engine_url(origin, "/start", allocator)
 	argv := []string{
-		"oj",
+		"htthor",
 		"--session=cap-cookie",
 		"--follow",
 		"--pretty=none",
@@ -531,7 +531,7 @@ test_session_cookie_value_respects_domain_path_and_secure :: proc(t: ^testing.T)
 	strings.builder_init(&err_out, allocator)
 
 	argv := []string{
-		"oj",
+		"htthor",
 		"--session=cookie-value",
 		"--offline",
 		"-p", "h",
@@ -620,7 +620,7 @@ test_session_cookie_expiry_is_not_persisted :: proc(t: ^testing.T) {
 	session_seed(t, sandbox, "cap-cookie.json", "gone.json")
 
 	argv := []string{
-		"oj",
+		"htthor",
 		"--session=gone",
 		"--offline",
 		"-p", "h",
@@ -751,7 +751,7 @@ test_session_legacy_auth_is_applied :: proc(t: ^testing.T) {
 	strings.builder_init(&err_out, allocator)
 
 	argv := []string{
-		"oj",
+		"htthor",
 		"--session=legacy",
 		"--offline",
 		"-p", "H",
@@ -809,7 +809,7 @@ test_session_path_without_a_port_keeps_the_host_directory :: proc(t: ^testing.T)
 	session_seed_in_host_dir(t, sandbox, "example.org", "cap1.json", "cap-host.json")
 
 	read_argv := []string{
-		"oj",
+		"htthor",
 		"--session-read-only=cap-host",
 		"--offline",
 		"-p", "H",
@@ -834,7 +834,7 @@ test_session_path_without_a_port_keeps_the_host_directory :: proc(t: ^testing.T)
 
 	// A `--session=` run writes to that same directory...
 	write_argv := []string{
-		"oj",
+		"htthor",
 		"--session=cap-host-new",
 		"--offline",
 		"-p", "H",
@@ -921,7 +921,7 @@ test_session_path_binds_a_falsy_host_item_to_the_url_host :: proc(t: ^testing.T)
 	session_seed_in_host_dir(t, sandbox, "example.org", "cap1.json", "cap-host-item.json")
 
 	read_argv := []string{
-		"oj",
+		"htthor",
 		"--session-read-only=cap-host-item",
 		"--offline",
 		"-p", "H",
@@ -947,7 +947,7 @@ test_session_path_binds_a_falsy_host_item_to_the_url_host :: proc(t: ^testing.T)
 
 	// ...and a `--session=` run with the same item writes there too.
 	write_argv := []string{
-		"oj",
+		"htthor",
 		"--session=cap-host-item-new",
 		"--offline",
 		"-p", "H",
@@ -1033,7 +1033,7 @@ test_session_path_binds_a_scheme_less_url_to_its_host :: proc(t: ^testing.T) {
 	session_seed_in_host_dir(t, sandbox, "example.org", "cap1.json", "cap-schemeless.json")
 
 	read_argv := []string{
-		"oj",
+		"htthor",
 		"--session-read-only=cap-schemeless",
 		"--offline",
 		"-p", "H",
@@ -1057,7 +1057,7 @@ test_session_path_binds_a_scheme_less_url_to_its_host :: proc(t: ^testing.T) {
 	)
 
 	write_argv := []string{
-		"oj",
+		"htthor",
 		"--session=cap-schemeless-new",
 		"--offline",
 		"-p", "H",
@@ -1175,7 +1175,7 @@ session_sandbox :: proc(t: ^testing.T, name: string, allocator: mem.Allocator) -
 		base = tmp
 	}
 	path := fmt.aprintf(
-		"%s/oj-session-selftest-%s-%d",
+		"%s/htthor-session-selftest-%s-%d",
 		base,
 		name,
 		time.time_to_unix(time.now()),
@@ -1269,7 +1269,7 @@ test_session_legacy_header_layout_warns :: proc(t: ^testing.T) {
 	)
 
 	argv := []string{
-		"oj",
+		"htthor",
 		"--session=cap-legacy",
 		"--offline",
 		"-p", "H",
@@ -1287,7 +1287,7 @@ test_session_legacy_header_layout_warns :: proc(t: ^testing.T) {
 		strings.to_string(out),
 	)
 
-	want := "\noj: warning: Outdated layout detected for the current session. Please consider updating it,\n" +
+	want := "\nhtthor: warning: Outdated layout detected for the current session. Please consider updating it,\n" +
 		"in order to use the latest features regarding the header layout.\n" +
 		"\nFor fixing the current session:\n" +
 		"\n    $ httpie cli sessions upgrade 127.0.0.1 cap-legacy\n" +

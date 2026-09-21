@@ -234,13 +234,13 @@ EIGHT_COLOR_TERMS := [?]string{
 // returned string is a view into argv; nothing is allocated.
 program_name_of :: proc(argv: []string) -> string {
 	if len(argv) == 0 || argv[0] == "" {
-		return "oj"
+		return "htthor"
 	}
 	name := argv[0]
 	if slash := strings.last_index_byte(name, '/'); slash >= 0 {
 		name = name[slash + 1:]
 	}
-	return name == "" ? "oj" : name
+	return name == "" ? "htthor" : name
 }
 
 Auth_Type :: enum {
@@ -442,7 +442,7 @@ options_default :: proc(allocator: mem.Allocator, program_name: string) -> Optio
 	}
 	name := strings.clone(program_name, allocator) or_else ""
 	opts.program_name = name
-	// `https` (and `oj-https`) defaults to https://, `http` to http://.
+	// `https` (and `htthor-https`) defaults to https://, `http` to http://.
 	if strings.has_suffix(program_name, "https") {
 		opts.script_scheme = .HTTPS
 	}

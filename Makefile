@@ -1,4 +1,4 @@
-# oj — an httpie port in Odin. See docs/ARCHITECTURE.md for the module
+# HTThor — an httpie port in Odin. See docs/ARCHITECTURE.md for the module
 # boundaries, the HTTP/TLS backend choice and the memory ownership rules.
 #
 # Per-machine toolchain paths live in local.mk (git-ignored) so this file stays
@@ -11,7 +11,7 @@
 
 ODIN       ?= odin
 BUILD_DIR  ?= build
-BIN        ?= $(BUILD_DIR)/oj
+BIN        ?= $(BUILD_DIR)/htthor
 
 COLLECTION ?= -collection:src=src
 ODIN_FLAGS ?= -o:speed -vet -warnings-as-errors

@@ -1,6 +1,6 @@
-# oj — HTTPie 3.2.4, ported to Odin
+# HTThor — HTTPie 3.2.4, ported to Odin
 
-`oj` is a 1:1 port of the [HTTPie](https://httpie.io) command-line HTTP client, reference release **3.2.4**, to the [Odin](https://odin-lang.org) programming language. It is a single, dynamically linked executable: the argv parser and request-item mini-language, the request/response model, the HTTP exchange, and the terminal renderer (Pygments-compatible colouring, JSON/XML pretty-printing) are all implemented in Odin. There is no Python runtime and no dependency on the reference implementation at run time.
+`HTThor` is a 1:1 port of the [HTTPie](https://httpie.io) command-line HTTP client, reference release **3.2.4**, to the [Odin](https://odin-lang.org) programming language. It is a single, dynamically linked executable: the argv parser and request-item mini-language, the request/response model, the HTTP exchange, and the terminal renderer (Pygments-compatible colouring, JSON/XML pretty-printing) are all implemented in Odin. There is no Python runtime and no dependency on the reference implementation at run time.
 
 The reference release's observable behaviour — CLI grammar, error wording, exit codes, request and response rendering — is the specification the port targets. For example, `--help`, `--manual` and `--version` print the recorded HTTPie 3.2.4 output.
 
@@ -27,7 +27,7 @@ ODIN := /usr/bin/odin
 ## Build and test
 
 ```sh
-make build   # compile -> build/oj
+make build   # compile -> build/htthor
 make check   # type-check src and tests, no codegen
 make test    # run the Odin unit suite in tests/
 ```
@@ -37,7 +37,7 @@ make test    # run the Odin unit suite in tests/
 | target | what it does |
 | --- | --- |
 | `all` | default target; builds the binary (same as `build`) |
-| `build` | compiles `build/oj` with `-o:speed -vet -warnings-as-errors`, linking `-lcurl` |
+| `build` | compiles `build/htthor` with `-o:speed -vet -warnings-as-errors`, linking `-lcurl` |
 | `check` | type-checks `src` and `tests` with `-vet -warnings-as-errors`, no codegen |
 | `check-deps` | checks that the `ODIN` executable is available |
 | `clean` | removes the `build/` directory |
@@ -50,10 +50,10 @@ A successful `make test` currently reports `Finished 176 tests ... All tests wer
 
 ## Usage and quick start
 
-Build once, then invoke `build/oj`. The first examples are offline and need no server. `--version` prints the reference version:
+Build once, then invoke `build/htthor`. The first examples are offline and need no server. `--version` prints the reference version:
 
 ```sh
-./build/oj --version
+./build/htthor --version
 ```
 
 ```text
@@ -62,11 +62,11 @@ Build once, then invoke `build/oj`. The first examples are offline and need no s
 
 `--offline` builds and prints the request without sending it. The two flags below keep the example reproducible in scripts and terminals:
 
-- `--ignore-stdin` stops `oj` from reading a request body from redirected stdin, so the command neither blocks on an open pipe nor changes its output when stdin is not a terminal. Scripting should pass it.
+- `--ignore-stdin` stops `HTThor` from reading a request body from redirected stdin, so the command neither blocks on an open pipe nor changes its output when stdin is not a terminal. Scripting should pass it.
 - `--pretty=none` disables terminal colouring, so the printed block is plain text and identical in a pipe and a terminal.
 
 ```sh
-./build/oj --offline --ignore-stdin --pretty=none GET localhost:8000/hello
+./build/htthor --offline --ignore-stdin --pretty=none GET localhost:8000/hello
 ```
 
 ```text
@@ -84,7 +84,7 @@ The rendered block uses CRLF line endings (HTTP message framing); the line break
 Request items (`name=value`, `Name:value`, `name==query`, and so on) build the body and the headers:
 
 ```sh
-./build/oj --offline --ignore-stdin --pretty=none POST localhost:8000/hello name=world
+./build/htthor --offline --ignore-stdin --pretty=none POST localhost:8000/hello name=world
 ```
 
 ```text
@@ -103,10 +103,10 @@ Host: localhost:8000
 A real request (requires network access):
 
 ```sh
-./build/oj --ignore-stdin --print=hb GET https://example.com
+./build/htthor --ignore-stdin --print=hb GET https://example.com
 ```
 
-`--print=hb` selects the response headers and body. Without `--print`, the default follows HTTPie: `hb` when stdout is a terminal, and body only when stdout is redirected to a file or a pipe. `./build/oj --help` lists the full option set, including the request-item separators (`=` JSON/form field, `:=` typed JSON, `==` query parameter, `:` header, `@` file upload, `=@` embedded file content, `:=@` embedded raw JSON), the body-encoding flags (`--json`, `--form`, `--multipart`, `--raw`, `--boundary`), and the authentication, session, proxy, output and SSL options.
+`--print=hb` selects the response headers and body. Without `--print`, the default follows HTTPie: `hb` when stdout is a terminal, and body only when stdout is redirected to a file or a pipe. `./build/htthor --help` lists the full option set, including the request-item separators (`=` JSON/form field, `:=` typed JSON, `==` query parameter, `:` header, `@` file upload, `=@` embedded file content, `:=@` embedded raw JSON), the body-encoding flags (`--json`, `--form`, `--multipart`, `--raw`, `--boundary`), and the authentication, session, proxy, output and SSL options.
 
 ## Architecture
 
@@ -146,7 +146,7 @@ Transport. The HTTP exchange is performed by libcurl through a hand-written, thi
 
 ## Status and limitations
 
-- The port targets HTTPie **3.2.4**; `./build/oj --version` prints `3.2.4`.
+- The port targets HTTPie **3.2.4**; `./build/htthor --version` prints `3.2.4`.
 - There is no `LICENSE` or `COPYING` file in this repository.
 - There is no CI configuration (`.github/` is absent).
 - The tree contains no Python.

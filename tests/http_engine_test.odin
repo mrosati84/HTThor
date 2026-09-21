@@ -649,7 +649,7 @@ test_engine_sends_the_multipart_body_bytes :: proc(t: ^testing.T) {
 	// The upload: a file in the temp directory, whose leaf name the engine has
 	// to infer as the multipart filename.
 	temp_dir := engine_scratch_dir(t)
-	upload_path := fmt.aprintf("%s/oj_engine_upload.txt", temp_dir, allocator = allocator)
+	upload_path := fmt.aprintf("%s/htthor_engine_upload.txt", temp_dir, allocator = allocator)
 	upload_contents := "upload payload\n"
 	write_err := os.write_entire_file(upload_path, transmute([]u8)upload_contents)
 	testing.expect(t, write_err == nil, "the upload fixture must be written")
@@ -696,7 +696,7 @@ test_engine_sends_the_multipart_body_bytes :: proc(t: ^testing.T) {
 	}
 	expected_body := fmt.aprintf(
 		"--%s\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nJohn\r\n" +
-		"--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"oj_engine_upload.txt\"\r\n" +
+		"--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"htthor_engine_upload.txt\"\r\n" +
 		"\r\n%s\r\n--%s--\r\n",
 		boundary, boundary, upload_contents, boundary,
 		allocator = allocator,
@@ -1324,7 +1324,7 @@ test_engine_streams_the_body_of_an_answered_3xx :: proc(t: ^testing.T) {
 	engine_queue_reply(server, "HTTP/1.1 305 Use Proxy\r\nLocation: /next\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nConnection: close\r\n\r\nredirect body\n")
 
 	temp_dir := engine_scratch_dir(t)
-	download_path := fmt.aprintf("%s/oj_engine_answered_3xx.txt", temp_dir, allocator = allocator)
+	download_path := fmt.aprintf("%s/htthor_engine_answered_3xx.txt", temp_dir, allocator = allocator)
 
 	file, open_err := os.open(download_path, os.O_CREATE | os.O_WRONLY | os.O_TRUNC, os.Permissions_Default_File)
 	testing.expect(t, open_err == nil, "the writer must open")
@@ -1375,7 +1375,7 @@ test_engine_streams_the_body_of_a_redirect_status_without_a_location :: proc(t: 
 	engine_queue_reply(server, "HTTP/1.1 302 Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nConnection: close\r\n\r\nredirect body\n")
 
 	temp_dir := engine_scratch_dir(t)
-	download_path := fmt.aprintf("%s/oj_engine_302_no_location.txt", temp_dir, allocator = allocator)
+	download_path := fmt.aprintf("%s/htthor_engine_302_no_location.txt", temp_dir, allocator = allocator)
 
 	file, open_err := os.open(download_path, os.O_CREATE | os.O_WRONLY | os.O_TRUNC, os.Permissions_Default_File)
 	testing.expect(t, open_err == nil, "the writer must open")
@@ -1524,7 +1524,7 @@ test_engine_reports_connection_and_resolution_failures :: proc(t: ^testing.T) {
 	testing.expect_value(t, refused_response.status, 0)
 
 	// A name that cannot resolve (`.invalid` is reserved for exactly this).
-	dns_url := strings.clone("http://oj-does-not-resolve.invalid/", allocator)
+	dns_url := strings.clone("http://htthor-does-not-resolve.invalid/", allocator)
 	dns, dns_err := http.request_create(allocator, .GET, dns_url, nil)
 	testing.expect_value(t, dns_err, http.Error.None)
 	dns_response: http.Response
@@ -1629,7 +1629,7 @@ test_engine_streams_the_body_to_a_caller_writer :: proc(t: ^testing.T) {
 	testing.expect(t, started, "the echo server must start")
 
 	temp_dir := engine_scratch_dir(t)
-	download_path := fmt.aprintf("%s/oj_engine_download.txt", temp_dir, allocator = allocator)
+	download_path := fmt.aprintf("%s/htthor_engine_download.txt", temp_dir, allocator = allocator)
 
 	file, open_err := os.open(download_path, os.O_CREATE | os.O_WRONLY | os.O_TRUNC, os.Permissions_Default_File)
 	testing.expect(t, open_err == nil, "the download sink must open")
@@ -1842,10 +1842,10 @@ test_engine_reads_netrc_credentials :: proc(t: ^testing.T) {
 	allocator := mem.tracking_allocator(&track)
 
 	temp_dir := engine_scratch_dir(t)
-	netrc_path := fmt.aprintf("%s/oj_engine_netrc", temp_dir, allocator = allocator)
+	netrc_path := fmt.aprintf("%s/htthor_engine_netrc", temp_dir, allocator = allocator)
 	written := os.write_entire_file_from_string(
 		netrc_path,
-		"# oj engine test\n" +
+		"# htthor engine test\n" +
 		"machine 127.0.0.1\n" +
 		"  login user\n" +
 		"  password pass\n" +

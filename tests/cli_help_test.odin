@@ -48,14 +48,14 @@ test_meta_action_is_the_left_most_of_the_three :: proc(t: ^testing.T) {
 		argv: []string,
 		want: cli.Meta_Action,
 	}{
-		{[]string{"oj", "example.com"}, cli.Meta_Action.None},
-		{[]string{"oj", "--help"}, cli.Meta_Action.Help},
-		{[]string{"oj", "--manual"}, cli.Meta_Action.Manual},
-		{[]string{"oj", "--version"}, cli.Meta_Action.Version},
-		{[]string{"oj", "--help", "--version"}, cli.Meta_Action.Help},
-		{[]string{"oj", "--version", "--help"}, cli.Meta_Action.Version},
-		{[]string{"oj", "--manual", "--help"}, cli.Meta_Action.Manual},
-		{[]string{"oj", "--help", "--manual"}, cli.Meta_Action.Help},
+		{[]string{"htthor", "example.com"}, cli.Meta_Action.None},
+		{[]string{"htthor", "--help"}, cli.Meta_Action.Help},
+		{[]string{"htthor", "--manual"}, cli.Meta_Action.Manual},
+		{[]string{"htthor", "--version"}, cli.Meta_Action.Version},
+		{[]string{"htthor", "--help", "--version"}, cli.Meta_Action.Help},
+		{[]string{"htthor", "--version", "--help"}, cli.Meta_Action.Version},
+		{[]string{"htthor", "--manual", "--help"}, cli.Meta_Action.Manual},
+		{[]string{"htthor", "--help", "--manual"}, cli.Meta_Action.Help},
 	}
 	for entry in cases {
 		options, err := parse_cli(entry.argv, allocator)
@@ -91,7 +91,7 @@ test_meta_action_does_not_swallow_a_usage_error :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	_, err := parse_cli([]string{"oj", "--style=nope", "--help"}, allocator)
+	_, err := parse_cli([]string{"htthor", "--style=nope", "--help"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.Usage)
 	cli.parse_error_destroy(&err)
 	expect_no_leaks(t, &track)

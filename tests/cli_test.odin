@@ -19,7 +19,7 @@ test_parse_args_defaults :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	options, err := parse_cli([]string{"oj", "example.com"}, allocator)
+	options, err := parse_cli([]string{"htthor", "example.com"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
 	testing.expect_value(t, options.method, http.Method.GET)
 	testing.expect_value(t, options.url, "example.com")
@@ -48,7 +48,7 @@ test_parse_args_reads_flags_in_both_forms :: proc(t: ^testing.T) {
 	allocator := mem.tracking_allocator(&track)
 
 	argv := []string{
-		"oj",
+		"htthor",
 		"--offline",
 		"--follow",
 		"--timeout=5",
@@ -96,7 +96,7 @@ test_parse_args_usage_errors_release_partial_options :: proc(t: ^testing.T) {
 
 	// --offline and the URL allocate before --bogus is rejected, so this also
 	// covers the cleanup path in usage_error.
-	argv := []string{"oj", "--offline", "https://example.com/", "--bogus"}
+	argv := []string{"htthor", "--offline", "https://example.com/", "--bogus"}
 	_, err := parse_cli(argv, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.Usage)
 	testing.expectf(t, strings.contains(err.message, "--bogus"), "unexpected message: %s", err.message)
@@ -112,7 +112,7 @@ test_parse_args_rejects_missing_value :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	_, err := parse_cli([]string{"oj", "example.com", "--timeout"}, allocator)
+	_, err := parse_cli([]string{"htthor", "example.com", "--timeout"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.Usage)
 	testing.expectf(t, strings.contains(err.message, "--timeout"), "unexpected message: %s", err.message)
 	cli.parse_error_destroy(&err)
@@ -127,7 +127,7 @@ test_parse_args_double_dash_ends_flags :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	options, err := parse_cli([]string{"oj", "--offline", "--", "example.com", "--offline=x"}, allocator)
+	options, err := parse_cli([]string{"htthor", "--offline", "--", "example.com", "--offline=x"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
 	testing.expect_value(t, options.url, "example.com")
 	testing.expect_value(t, len(options.items), 1)
@@ -149,7 +149,7 @@ test_parse_args_second_method_like_item_is_an_item :: proc(t: ^testing.T) {
 	// takes it and `POST` has to be a request item — and a bare word without a
 	// separator is not one. The reference exits 1 with "'POST' is not a valid
 	// value".
-	_, err := parse_cli([]string{"oj", "example.com", "POST"}, allocator)
+	_, err := parse_cli([]string{"htthor", "example.com", "POST"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.Usage)
 	testing.expectf(
 		t,
@@ -221,7 +221,7 @@ test_parse_args_item_message_repr_escapes_a_control_character :: proc(t: ^testin
 	}
 	for entry in cases {
 		argv := []string{
-			"oj", "--offline", "--ignore-stdin", "-p", "HB", "POST", "example.com", entry.item,
+			"htthor", "--offline", "--ignore-stdin", "-p", "HB", "POST", "example.com", entry.item,
 		}
 		_, err := parse_cli(argv, allocator)
 		testing.expectf(
@@ -288,7 +288,7 @@ test_parse_args_item_message_repr_escapes_a_nonprintable_character :: proc(t: ^t
 	}
 	for entry in cases {
 		argv := []string{
-			"oj", "--offline", "--ignore-stdin", "-p", "HB", "POST", "example.com", entry.item,
+			"htthor", "--offline", "--ignore-stdin", "-p", "HB", "POST", "example.com", entry.item,
 		}
 		_, err := parse_cli(argv, allocator)
 		testing.expectf(
@@ -328,7 +328,7 @@ test_parse_args_backslash_pair_consumes_the_character :: proc(t: ^testing.T) {
 
 	// The pair is kept whole and the separator behind it is live: the item is
 	// the header `a\\` with the value `b` (two backslashes, then `b`).
-	options, err := parse_cli([]string{"oj", "--offline", "example.com", "a\\\\:b"}, allocator)
+	options, err := parse_cli([]string{"htthor", "--offline", "example.com", "a\\\\:b"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
 	testing.expect_value(t, len(options.item_set.headers), 1)
 	testing.expect_value(t, options.item_set.headers[0].name, "a\\\\")
@@ -336,14 +336,14 @@ test_parse_args_backslash_pair_consumes_the_character :: proc(t: ^testing.T) {
 	cli.options_destroy(&options)
 
 	// Four backslashes are two pairs, all four kept.
-	options, err = parse_cli([]string{"oj", "--offline", "example.com", "a\\\\\\\\:b"}, allocator)
+	options, err = parse_cli([]string{"htthor", "--offline", "example.com", "a\\\\\\\\:b"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
 	testing.expect_value(t, options.item_set.headers[0].name, "a\\\\\\\\")
 	cli.options_destroy(&options)
 
 	// An odd run is a pair and then an escape: three backslashes leave two and
 	// escape the `:`, so the *next* `:` is the separator and the name keeps it.
-	options, err = parse_cli([]string{"oj", "--offline", "example.com", "a\\\\\\:b:value"}, allocator)
+	options, err = parse_cli([]string{"htthor", "--offline", "example.com", "a\\\\\\:b:value"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
 	testing.expect_value(t, options.item_set.headers[0].name, "a\\\\:b")
 	testing.expect_value(t, options.item_set.headers[0].value, "value")
@@ -351,7 +351,7 @@ test_parse_args_backslash_pair_consumes_the_character :: proc(t: ^testing.T) {
 
 	// The separator *scan*'s half: the pair makes the first `=` live, so the key
 	// is `a\\` and the value `b=c` — not the key `a\\=b` a one-byte scan reads.
-	options, err = parse_cli([]string{"oj", "--offline", "example.com", "a\\\\=b=c"}, allocator)
+	options, err = parse_cli([]string{"htthor", "--offline", "example.com", "a\\\\=b=c"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
 	testing.expect_value(t, len(options.item_set.data), 1)
 	testing.expect_value(t, options.item_set.data[0].key, "a\\\\")
@@ -364,7 +364,7 @@ test_parse_args_backslash_pair_consumes_the_character :: proc(t: ^testing.T) {
 	// And the unescape's half, where it is visible on its own: the message a
 	// missing file raises quotes the path the *unescape* produced, and it is a
 	// `repr()`, so each of the two backslashes is spelled twice.
-	argv := []string{"oj", "--offline", "--ignore-stdin", "-p", "H", "POST", "example.com",
+	argv := []string{"htthor", "--offline", "--ignore-stdin", "-p", "H", "POST", "example.com",
 	                 "x=@a\\\\:b.txt"}
 	_, err = parse_cli(argv, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.Usage)
@@ -393,7 +393,7 @@ test_parse_args_embed_refuses_a_file_that_is_not_utf8 :: proc(t: ^testing.T) {
 	// read_text_file, and the parity scenarios pin all four.
 	directory, path := embed_sandbox_file(t, "bad", []u8{0x61, 0xff, 0x62, 0x0a}, allocator)
 	item := strings.concatenate({"note=@", path}, allocator)
-	argv := []string{"oj", "--offline", "--ignore-stdin", "-p", "H", "POST", "example.com", item}
+	argv := []string{"htthor", "--offline", "--ignore-stdin", "-p", "H", "POST", "example.com", item}
 	_, err := parse_cli(argv, allocator)
 
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.Usage)
@@ -447,7 +447,7 @@ test_parse_args_form_wrapper_swallows_the_raw_json_file_refusals :: proc(t: ^tes
 	for path, index in paths {
 		item := strings.concatenate({"x:=@", path}, allocator)
 		_, err := parse_cli(
-			[]string{"oj", "--offline", "--ignore-stdin", "-f", "-p", "H", "POST", "example.com", item},
+			[]string{"htthor", "--offline", "--ignore-stdin", "-f", "-p", "H", "POST", "example.com", item},
 			allocator,
 		)
 		testing.expectf(
@@ -462,7 +462,7 @@ test_parse_args_form_wrapper_swallows_the_raw_json_file_refusals :: proc(t: ^tes
 		delete(item, allocator)
 	}
 	_, inline_err := parse_cli(
-		[]string{"oj", "--offline", "--ignore-stdin", "-f", "-p", "H", "POST", "example.com", "x:=not-json"},
+		[]string{"htthor", "--offline", "--ignore-stdin", "-f", "-p", "H", "POST", "example.com", "x:=not-json"},
 		allocator,
 	)
 	testing.expectf(
@@ -477,7 +477,7 @@ test_parse_args_form_wrapper_swallows_the_raw_json_file_refusals :: proc(t: ^tes
 	// The `null` half of the value rule — and its `true` control, which is a
 	// primitive to the wrapper (`True` on the wire, Python's `str(int)`).
 	_, null_err := parse_cli(
-		[]string{"oj", "--offline", "--ignore-stdin", "-f", "-p", "H", "POST", "example.com", "x:=null"},
+		[]string{"htthor", "--offline", "--ignore-stdin", "-f", "-p", "H", "POST", "example.com", "x:=null"},
 		allocator,
 	)
 	testing.expectf(
@@ -490,7 +490,7 @@ test_parse_args_form_wrapper_swallows_the_raw_json_file_refusals :: proc(t: ^tes
 	cli.parse_error_destroy(&null_err)
 
 	options, bool_err := parse_cli(
-		[]string{"oj", "--offline", "--ignore-stdin", "-f", "-p", "H", "POST", "example.com", "x:=true"},
+		[]string{"htthor", "--offline", "--ignore-stdin", "-f", "-p", "H", "POST", "example.com", "x:=true"},
 		allocator,
 	)
 	testing.expect_value(t, bool_err.kind, cli.Parse_Error_Kind.None)
@@ -511,11 +511,11 @@ test_parse_args_form_wrapper_swallows_the_raw_json_file_refusals :: proc(t: ^tes
 	)
 	for with_form in ([]bool{true, false}) {
 		argv := []string{
-			"oj", "--offline", "--ignore-stdin", "-p", "H", "POST", "example.com", control_item,
+			"htthor", "--offline", "--ignore-stdin", "-p", "H", "POST", "example.com", control_item,
 		}
 		if with_form {
 			argv = []string{
-				"oj", "--offline", "--ignore-stdin", "-f", "-p", "H", "POST", "example.com", control_item,
+				"htthor", "--offline", "--ignore-stdin", "-f", "-p", "H", "POST", "example.com", control_item,
 			}
 		}
 		_, err := parse_cli(argv, allocator)
@@ -557,7 +557,7 @@ test_parse_args_bare_atfile_keeps_non_utf8_bytes :: proc(t: ^testing.T) {
 
 	directory, path := embed_sandbox_file(t, "bare", []u8{0x61, 0xff, 0x62, 0x0a}, allocator)
 	item := strings.concatenate({"@", path}, allocator)
-	argv := []string{"oj", "--offline", "--ignore-stdin", "-p", "H", "POST", "example.com", item}
+	argv := []string{"htthor", "--offline", "--ignore-stdin", "-p", "H", "POST", "example.com", item}
 	options, err := parse_cli(argv, allocator)
 
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.None)
@@ -594,7 +594,7 @@ embed_sandbox_file :: proc(
 		allocator = context.temp_allocator,
 	)
 	directory = strings.concatenate(
-		{base, "/oj-embed-selftest-", name, "-", unique},
+		{base, "/htthor-embed-selftest-", name, "-", unique},
 		allocator,
 	)
 	if err := os.make_directory_all(directory, os.Permissions{.Read_User, .Write_User, .Execute_User}); err != nil && err != .Exist {
@@ -669,7 +669,7 @@ test_parse_args_refuses_a_raw_body_the_utf8_codec_cannot_encode :: proc(t: ^test
 	}
 	for entry in refusals {
 		raw := strings.concatenate({"--raw=", entry.body}, context.temp_allocator)
-		argv := []string{"oj", "--offline", "-p", "b", "POST", "example.com", raw}
+		argv := []string{"htthor", "--offline", "-p", "b", "POST", "example.com", raw}
 		options, err := parse_cli(argv, allocator)
 		testing.expectf(
 			t,
@@ -698,7 +698,7 @@ test_parse_args_refuses_a_raw_body_the_utf8_codec_cannot_encode :: proc(t: ^test
 	controls := []string{"{\"a\": 1}", "{\"a\": \"é\"}", "{\"a\": \"😀\"}", ""}
 	for body in controls {
 		raw := strings.concatenate({"--raw=", body}, context.temp_allocator)
-		argv := []string{"oj", "--offline", "-p", "b", "POST", "example.com", raw}
+		argv := []string{"htthor", "--offline", "-p", "b", "POST", "example.com", raw}
 		options, err := parse_cli(argv, allocator)
 		testing.expectf(t, err.kind == cli.Parse_Error_Kind.None, "%s: refused: %v", body, err.message)
 		cli.options_destroy(&options)
@@ -711,7 +711,7 @@ test_parse_args_refuses_a_raw_body_the_utf8_codec_cannot_encode :: proc(t: ^test
 	// (`--raw=<body> a=1` leaves the item as argparse's own leftover, below).
 	{
 		raw := strings.concatenate({"--raw=", "{\"a\": \"", BAD, "\"}"}, context.temp_allocator)
-		argv := []string{"oj", "--offline", "-p", "b", "POST", "example.com", "a=1", raw}
+		argv := []string{"htthor", "--offline", "-p", "b", "POST", "example.com", "a=1", raw}
 		options, err := parse_cli(argv, allocator)
 		testing.expect_value(t, err.kind, cli.Parse_Error_Kind.Usage)
 		testing.expectf(
@@ -731,7 +731,7 @@ test_parse_args_refuses_a_raw_body_the_utf8_codec_cannot_encode :: proc(t: ^test
 	// is reached at all, so the encode is never asked about it.
 	{
 		raw := strings.concatenate({"--raw=", "{\"a\": \"", BAD, "\"}"}, context.temp_allocator)
-		argv := []string{"oj", "--offline", "-p", "b", "POST", "example.com", raw, "a=1"}
+		argv := []string{"htthor", "--offline", "-p", "b", "POST", "example.com", raw, "a=1"}
 		options, err := parse_cli(argv, allocator)
 		testing.expect_value(t, err.kind, cli.Parse_Error_Kind.Usage)
 		testing.expectf(
@@ -751,7 +751,7 @@ test_parse_args_refuses_a_raw_body_the_utf8_codec_cannot_encode :: proc(t: ^test
 	// (`cannot combine --compress and --chunked`) is never reported.
 	{
 		raw := strings.concatenate({"--raw=", "{\"a\": \"", BAD, "\"}"}, context.temp_allocator)
-		argv := []string{"oj", "--offline", "--compress", "--chunked", "-p", "b", "POST", "example.com", raw}
+		argv := []string{"htthor", "--offline", "--compress", "--chunked", "-p", "b", "POST", "example.com", raw}
 		options, err := parse_cli(argv, allocator)
 		testing.expectf(
 			t,
@@ -793,7 +793,7 @@ test_parse_args_short_option_clusters_do_not_leak :: proc(t: ^testing.T) {
 	// `-vv` and `-xx` are two Count actions each; `-vvv` clusters twice, so the
 	// first clone is still live when the second one is made.
 	argv := []string{
-		"oj",
+		"htthor",
 		"--offline",
 		"-vv",
 		"-xx",
@@ -827,7 +827,7 @@ test_parse_args_blanket_no_option_form_resets_flags :: proc(t: ^testing.T) {
 
 	options, err := parse_cli(
 		[]string{
-			"oj",
+			"htthor",
 			"--offline",
 			"--follow",
 			"--check-status",
@@ -850,7 +850,7 @@ test_parse_args_blanket_no_option_form_resets_flags :: proc(t: ^testing.T) {
 
 	// An inverted name that is no action's option string stays an extra, and
 	// is reported by the same `invalid` list.
-	_, bogus := parse_cli([]string{"oj", "--offline", "--no-bogus", "example.com"}, allocator)
+	_, bogus := parse_cli([]string{"htthor", "--offline", "--no-bogus", "example.com"}, allocator)
 	testing.expect_value(t, bogus.kind, cli.Parse_Error_Kind.Usage)
 	testing.expectf(
 		t,
@@ -878,7 +878,7 @@ test_parse_args_no_option_resets_value_dests :: proc(t: ^testing.T) {
 	// its default, which is what makes the reset below observable
 	gone, gone_err := parse_cli(
 		[]string{
-			"oj",
+			"htthor",
 			"--timeout=5",
 			"--max-redirects=7",
 			"--pretty=none",
@@ -896,7 +896,7 @@ test_parse_args_no_option_resets_value_dests :: proc(t: ^testing.T) {
 
 	reset, reset_err := parse_cli(
 		[]string{
-			"oj",
+			"htthor",
 			"--timeout=5",
 			"--max-redirects=7",
 			"--pretty=none",
@@ -911,7 +911,7 @@ test_parse_args_no_option_resets_value_dests :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, reset_err.kind, cli.Parse_Error_Kind.None)
 
-	fresh, fresh_err := parse_cli([]string{"oj", "example.com"}, allocator)
+	fresh, fresh_err := parse_cli([]string{"htthor", "example.com"}, allocator)
 	testing.expect_value(t, fresh_err.kind, cli.Parse_Error_Kind.None)
 
 	testing.expect_value(t, reset.timeout_s, fresh.timeout_s)
@@ -939,7 +939,7 @@ test_parse_args_literal_no_sorted_forms_still_apply :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	no_sorted, no_sorted_err := parse_cli([]string{"oj", "--no-sorted", "example.com"}, allocator)
+	no_sorted, no_sorted_err := parse_cli([]string{"htthor", "--no-sorted", "example.com"}, allocator)
 	testing.expect_value(t, no_sorted_err.kind, cli.Parse_Error_Kind.None)
 	testing.expect(t, !no_sorted.format_options.headers_sort, "--no-sorted asks for unsorted headers")
 	testing.expect(t, !no_sorted.format_options.json_sort_keys, "--no-sorted asks for unsorted keys")
@@ -948,7 +948,7 @@ test_parse_args_literal_no_sorted_forms_still_apply :: proc(t: ^testing.T) {
 	// with `--unsorted` to show the literal really is applied: the groups fold
 	// in command-line order, and the last one wins.
 	no_unsorted, no_unsorted_err := parse_cli(
-		[]string{"oj", "--unsorted", "--no-unsorted", "example.com"},
+		[]string{"htthor", "--unsorted", "--no-unsorted", "example.com"},
 		allocator,
 	)
 	testing.expect_value(t, no_unsorted_err.kind, cli.Parse_Error_Kind.None)
@@ -1025,7 +1025,7 @@ test_parse_args_reports_a_malformed_config_file :: proc(t: ^testing.T) {
 		{"missing", {}, false, false, ""},
 	}
 
-	argv := []string{"oj", "--offline", "-p", "H", "POST", "example.org/x"}
+	argv := []string{"htthor", "--offline", "-p", "H", "POST", "example.org/x"}
 	for check in checks {
 		directory, path := config_sandbox(t, check.name, allocator)
 		if check.as_dir {
@@ -1111,7 +1111,7 @@ test_parse_args_config_warning_precedes_a_usage_error :: proc(t: ^testing.T) {
 
 	// No URL at all: the run ends as a usage error, and the warning still comes
 	// out first.
-	_, err, warning := cli.parse_args_with(env, []string{"oj"}, allocator)
+	_, err, warning := cli.parse_args_with(env, []string{"htthor"}, allocator)
 	testing.expect_value(t, err.kind, cli.Parse_Error_Kind.Usage)
 	want := fmt.aprintf(
 		"invalid config file: Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0) [%s]",
@@ -1172,61 +1172,61 @@ test_parse_args_config_value_shapes :: proc(t: ^testing.T) {
 		timeout: f64,
 	}{
 		// The root value `dict.update` refuses.
-		{"root-int", `5`, {"oj", "--offline", "example.org/x"},
+		{"root-int", `5`, {"htthor", "--offline", "example.org/x"},
 		 .Exception, "TypeError: 'int' object is not iterable", 0},
-		{"root-string", `"x"`, {"oj", "--offline", "example.org/x"},
+		{"root-string", `"x"`, {"htthor", "--offline", "example.org/x"},
 		 .Exception, "ValueError: dictionary update sequence element #0 has length 1; 2 is required", 0},
-		{"root-bool", `true`, {"oj", "--offline", "example.org/x"},
+		{"root-bool", `true`, {"htthor", "--offline", "example.org/x"},
 		 .Exception, "TypeError: 'bool' object is not iterable", 0},
 		// A string counts *characters*, and an array its elements.
-		{"root-list-short", `[[1]]`, {"oj", "--offline", "example.org/x"},
+		{"root-list-short", `[[1]]`, {"htthor", "--offline", "example.org/x"},
 		 .Exception, "ValueError: dictionary update sequence element #0 has length 1; 2 is required", 0},
-		{"root-list-scalar", `[5]`, {"oj", "--offline", "example.org/x"},
+		{"root-list-scalar", `[5]`, {"htthor", "--offline", "example.org/x"},
 		 .Exception, "TypeError: cannot convert dictionary update sequence element #0 to a sequence", 0},
-		{"root-list-later", `[["a", "b"], 5]`, {"oj", "--offline", "example.org/x"},
+		{"root-list-later", `[["a", "b"], 5]`, {"htthor", "--offline", "example.org/x"},
 		 .Exception, "TypeError: cannot convert dictionary update sequence element #1 to a sequence", 0},
 		// ...and a pair whose key could not be a dict key.
-		{"root-unhashable-key", `[[["a"], "b"]]`, {"oj", "--offline", "example.org/x"},
+		{"root-unhashable-key", `[[["a"], "b"]]`, {"htthor", "--offline", "example.org/x"},
 		 .Exception, "TypeError: unhashable type: 'list'", 0},
 		// A `default_options` that is not a list: the `+ args` of raw_main.
 		{"defaults-string", `{"default_options": "--style=pie"}`,
-		 {"oj", "--offline", "example.org/x"},
+		 {"htthor", "--offline", "example.org/x"},
 		 .Exception, `TypeError: can only concatenate str (not "list") to str`, 0},
-		{"defaults-float", `{"default_options": 1.5}`, {"oj", "--offline", "example.org/x"},
+		{"defaults-float", `{"default_options": 1.5}`, {"htthor", "--offline", "example.org/x"},
 		 .Exception, "TypeError: unsupported operand type(s) for +: 'float' and 'list'", 0},
 		{"defaults-object", `{"default_options": {"a": 1}}`,
-		 {"oj", "--offline", "example.org/x"},
+		 {"htthor", "--offline", "example.org/x"},
 		 .Exception, "TypeError: unsupported operand type(s) for +: 'dict' and 'list'", 0},
 		// An element `_parse_optional` refuses by type: a scalar has no `[0]`, a
 		// mapping has no key `0`, and an array's first element is fed to
 		// `in self.prefix_chars`.
-		{"item-int", `{"default_options": [5]}`, {"oj", "--offline", "example.org/x"},
+		{"item-int", `{"default_options": [5]}`, {"htthor", "--offline", "example.org/x"},
 		 .Exception, "TypeError: 'int' object is not subscriptable", 0},
-		{"item-nested-int", `{"default_options": [[1]]}`, {"oj", "--offline", "example.org/x"},
+		{"item-nested-int", `{"default_options": [[1]]}`, {"htthor", "--offline", "example.org/x"},
 		 .Exception, "TypeError: 'in <string>' requires string as left operand, not int", 0},
 		{"item-mapping", `{"default_options": [{"a": 1}]}`,
-		 {"oj", "--offline", "example.org/x"}, .Exception, "KeyError: 0", 0},
+		 {"htthor", "--offline", "example.org/x"}, .Exception, "KeyError: 0", 0},
 		{"item-empty-first-string", `{"default_options": [[""]]}`,
-		 {"oj", "--offline", "example.org/x"}, .Exception,
+		 {"htthor", "--offline", "example.org/x"}, .Exception,
 		 "TypeError: unhashable type: 'list'", 0},
 		// An element argparse uses as an argument string: the URL is left in
 		// `extras` (the block), or the element itself reaches the URL slot.
 		{"item-null-unrecognized", `{"default_options": [null]}`,
-		 {"oj", "--offline", "example.org/x"}, .Usage,
+		 {"htthor", "--offline", "example.org/x"}, .Usage,
 		 "unrecognized arguments: example.org/x", 0},
-		{"item-null-url-slot", `{"default_options": [null]}`, {"oj", "--offline"},
+		{"item-null-url-slot", `{"default_options": [null]}`, {"htthor", "--offline"},
 		 .Exception, "AttributeError: 'NoneType' object has no attribute 'startswith'", 0},
-		{"item-object-url-slot", `{"default_options": [{}]}`, {"oj", "--offline"},
+		{"item-object-url-slot", `{"default_options": [{}]}`, {"htthor", "--offline"},
 		 .Exception, "AttributeError: 'dict' object has no attribute 'startswith'", 0},
 		// The controls: the options a well-formed list carries really are used,
 		// and a root array's pair is one of the shapes that delivers them.
 		{"defaults-delivered", `{"default_options": ["--timeout=5"]}`,
-		 {"oj", "--offline", "example.org/x"}, .None, "", 5},
+		 {"htthor", "--offline", "example.org/x"}, .None, "", 5},
 		{"root-pair-delivered", `[["default_options", ["--timeout=5"]]]`,
-		 {"oj", "--offline", "example.org/x"}, .None, "", 5},
-		{"root-falsy", `[]`, {"oj", "--offline", "example.org/x"}, .None, "", 0},
+		 {"htthor", "--offline", "example.org/x"}, .None, "", 5},
+		{"root-falsy", `[]`, {"htthor", "--offline", "example.org/x"}, .None, "", 0},
 		{"defaults-empty-object", `{"default_options": {}}`,
-		 {"oj", "--offline", "example.org/x"}, .None, "", 0},
+		 {"htthor", "--offline", "example.org/x"}, .None, "", 0},
 	}
 
 	for check in checks {
@@ -1336,7 +1336,7 @@ test_parse_args_config_path_is_a_pure_join :: proc(t: ^testing.T) {
 		)
 		options, err, warning := cli.parse_args_with(
 			env,
-			[]string{"oj", "--offline", "example.org/x"},
+			[]string{"htthor", "--offline", "example.org/x"},
 			allocator,
 		)
 		want := fmt.aprintf(
@@ -1393,7 +1393,7 @@ config_sandbox :: proc(t: ^testing.T, name: string, allocator: mem.Allocator) ->
 		allocator = context.temp_allocator,
 	)
 	directory = strings.concatenate(
-		{base, "/oj-config-selftest-", name, "-", unique},
+		{base, "/htthor-config-selftest-", name, "-", unique},
 		allocator,
 	)
 	if err := os.make_directory_all(

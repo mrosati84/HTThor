@@ -792,7 +792,7 @@ apply_hop :: proc(
 	// its `fields-head-nobody` shows the same switch taking a *known-length*
 	// body away. Framing a HEAD under that switch is therefore not an option,
 	// and holding the framing flag down instead is the wire-only divergence
-	// this card's parent filed (build/chunked-no-items-probe-oj.txt's
+	// this card's parent filed (build/chunked-no-items-probe-htthor.txt's
 	// `chunked-no-items-head` row). requests has no such coupling: CPython's
 	// http.client writes the chunked body and reads no reply body because the
 	// *method* says so (`if (status == NO_CONTENT or status == NOT_MODIFIED or
