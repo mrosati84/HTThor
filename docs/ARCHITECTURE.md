@@ -6,47 +6,88 @@ backend choice, and the memory ownership rules. Change it deliberately or not at
 all; do not let code drift away from it silently.
 
 Written by t_89f5bafa (scaffold), against Odin `dev-2026-09` (nightly a2fb372)
-on Ubuntu 24.04 with libcurl 8.5.0.
+on Ubuntu 24.04 with libcurl 8.5.0. Revised by t_6bb80c81 against HEAD `c20e75e`:
+the full §1 inventory, §2's import graph and allocation rule, §4's
+`temp_allocator` rule, §5's golden replay, §6, and the new §8.
 
 ## 1. Repository layout
 
 ```
 src/main.odin          process entry point: reads the allocator once, parses argv,
                        builds the session Context, exits with the run's exit code
-src/cli/               Options (the parsed command line) + the argv parser
-src/session/           Context: the order of an invocation (meta flags -> request
-                       -> send -> render -> exit code)
+src/cli/               the parsed command line and the argv parser
+  options.odin         Options (the parsed command line), its defaults, destroy proc
+  parse.odin           the argv parser: option table, config/env defaults
+  items.odin           the request-item mini-language (name=value, name:=json,
+                       name==query, name:header, name@upload, bracket paths)
+  usage.odin           the usage/error block the parser's failures print
+  python_digits.odin   the CPython predicates rich's $COLUMNS gate runs
+  python_digits_generated.odin  their tables (generated)
+  help_text_generated.odin      the recorded --help/--manual bytes (generated)
+src/session/           the order of an invocation (meta flags -> request -> send
+                       -> render -> exit code)
+  context.odin         Context: that order, and the exit-code mapping
+  jar.odin             the session cookie jar (Set-Cookie replies -> Cookie header)
+  store.odin           session-file persistence (httpie's JSON session format)
 src/http/              the exchange: Request/Response types, URL splitter, dispose
                        helpers, the transport (`send`) and the libcurl binding
   types.odin           Method/Scheme/Header/Data_Item/Request/Response/Error
   url.odin             the URL splitter and the default-scheme heuristic
+  host.odin            the URL host: lowercase, escape-folding, IDNA, refusal rules
   request.odin         request_create and the builders (target, URL, Host, auth
                        header); request_prepare fills the derived headers
   owned.odin           allocator-explicit Buffer/slice helpers (see §4)
   body.odin            the body encodings: JSON, form, multipart, raw
   auth.odin            the Authorization header for basic/bearer
+  digest.odin          the client-side Digest handshake (RFC 2617)
+  md5.odin             MD5 (RFC 1321), for that handshake
+  netrc.odin           credentials from the user's netrc file
   proxy.odin           --proxy + environment/no_proxy resolution
+  header_validity.odin requests' check_header_validity
+  skippable.odin       urllib3's SKIPPABLE_HEADERS / SKIP_HEADER sentinel
+  python_str.odin      the reference's *str* layer (surrogateescape) in bytes
+  detect.odin          detect_encoding: the printed body's charset guess
+  detect_cd.odin       the coherence detector half of that guess
+  detect_md.odin       the mess-detector half of that guess
+  charset.odin         smart_decode/smart_encode: the printed text's codecs
   backend.odin         the `send`/`send_to` seam (the transport choice)
   curl_transport.odin  the exchange itself: options, callbacks, the redirect loop
   libcurl.odin         the only file that touches C
-src/output/            renderers writing to an io.Writer; allocates nothing
+  charset_generated.odin, detect_generated.odin, idna_generated.odin,
+  unicode_printable_generated.odin  the generated tables the files above read
+src/output/            renderers writing to an io.Writer (see the allocation rule
+                       in §2)
+  print.odin           the version line, errors, the request/response blocks
+  render.odin          the parity renderer: httpie's output contract, byte for byte
+  colorize.odin        byte-exact emulation of httpie's Pygments colouring
+  styles_generated.odin  the Pygments style table (generated)
 src/rich/              rich 15.0.0's own text rules the port needs: the emoji
                        pass (`:code:` -> the table's value) and the cell widths a
                        wrap measures, with the generated tables beside them
+  emoji.odin           the emoji pass
+  emoji_generated.odin its table (generated)
 src/format/            body classification (Content-Type -> Kind) and the
                        pretty-printing parameters the renderer will consume
+  content_type.odin    Kind, kind_for_content_type and the Indent enum
+  json.odin            the JSON value model, parser and serializer
+  xml.odin             XML pretty printing (httpie's XMLFormatter)
 tests/                 Odin `core:testing` suite (behaviour + ownership)
-docs/                  this file
+docs/                  this file, RATING.md, security-findings.md
 ```
 
 ## 2. Module boundaries
 
-Dependencies point one way only:
+Dependencies point one way only (this is the import graph the code has today,
+one line per package):
 
 ```
-main -> session -> { cli, http, output }
-              cli -> { http, format }
-            output -> http
+main    -> { cli, output, session }
+session -> { cli, format, http, output }
+cli     -> { format, http, rich }
+output  -> { format, http, rich }
+format  -> {}
+http    -> {}
+rich    -> {}
 ```
 
 Rules that hold the boundary in place:
@@ -55,16 +96,28 @@ Rules that hold the boundary in place:
   without a command line; that is also what makes it testable with a plain
   struct. The session copies the parsed options down onto the Request, because
   the session is the only layer that knows both vocabularies.
-- **`output` writes to an `io.Writer` it is handed and allocates nothing.**
-  No direct `os.stdout`/`os.stderr`, no formatting state kept between calls.
-  That is what lets the tests render into a `strings.Builder` and compare bytes.
+- **`output` writes to an `io.Writer` it is handed and owns no memory.** No
+  direct `os.stdout`/`os.stderr`, no formatting state kept between calls; that is
+  what lets the tests render into a `strings.Builder` and compare bytes. It is
+  not literally allocation-free: ten `make(` sites allocate scratch buffers, and
+  the rule is that they pass an allocator explicitly — seven do
+  (`colorize.odin:217,227,236,253,271`, `render.odin:283,457`) and three still
+  fall back on the implicit `context.allocator` (`colorize.odin:917,919,947`).
+  The three are known debt; new code must not add a fourth (see §8).
 - **`format` owns classification, not formatting.** `Kind` and
   `kind_for_content_type` decide *what* a body is; the pretty printer that
-  consumes the decision lands with the renderer (t_9a017f57). `Indent` lives
-  here too because the CLI collects it (`--format-options json.indent=N`).
+  consumes the decision is the renderer (`output/render.odin`), with the JSON/XML
+  value models in `format/json.odin` and `format/xml.odin`. `Indent` lives here
+  too because the CLI collects it (`--format-options json.indent=N`).
 - **The CLI is a parse, not a policy.** `cli.parse_args` returns Options or a
-  usage error; it never prints, never exits and never opens anything. Wording of
-  errors belongs to `output` (and to docs/PARITY.md).
+  usage error; it never prints and never exits, and the only filesystem reads it
+  performs are the ones parsing requires: the config file (`config_read`
+  → `config.json`, `parse.odin:2261`, called from `parse_args_with` `:3179`),
+  argparse's own readability probes (`file_is_readable` `:1745`, opening at
+  `:1746`; `file_is_openable_for_append` `:1755`, opening at `:1756`; both called
+  from the option validation at `:1300`/`:1306`), and the item files
+  (`cli/items.odin:861`). Wording of errors belongs to `output` (and to
+  docs/PARITY.md).
 - **Only `main` exits.** `session.run` returns an exit code (`cli.Exit_Code`);
   `main` destroys the Context and calls `os.exit` with it. Nothing else calls
   `os.exit`, and no `defer` in `main` is relied upon (defers do not run across
@@ -179,11 +232,18 @@ of `backend.odin`.
 
 ## 4. Memory ownership
 
-The hard rule: **`context.allocator` is read exactly once**, in `main`, and is
-then passed explicitly down every layer. No file under `src/` reads
-`context.allocator` or `context.temp_allocator` — not for a temporary string, not
-"just this once". Library code that needs memory takes a `mem.Allocator`
-parameter.
+The hard rule: **`context.allocator` is read exactly once**, in `main`
+(`src/main.odin:18`), and is then passed explicitly down every layer. No other
+file under `src/` reads it — not for a temporary string, not "just this once".
+Library code that needs memory takes a `mem.Allocator` parameter.
+
+`context.temp_allocator` falls under the same rule, **and the tree does not
+satisfy it yet**: 21 non-comment uses remain in 7 files — `cli/parse.odin` 9,
+`session/jar.odin` 4, `http/detect.odin` 3, `http/charset.odin` 2, and one each in
+`output/render.odin`, `session/context.odin`, `session/store.odin`. They are
+scratch-string sites (the suite's leak assertions still pass), but they are
+exactly the implicit-allocation model this section forbids. They are recorded as
+debt in §8: new code must take an allocator parameter, not add a 22nd use.
 
 Follow-on rules:
 
@@ -225,8 +285,9 @@ Follow-on rules:
    `Options` before returning; `request_create` destroys the partial `Request`
    before returning `Out_Of_Memory`; `main` destroys the `Parse_Error` before
    exiting. There is no "the process is about to die anyway" reasoning in
-   library code — the tests run every allocating path on a
-   `mem.Tracking_Allocator` and assert a zero balance.
+   library code — the tests run their allocating paths on a
+   `mem.Tracking_Allocator` and assert a zero balance (§5 names the three files
+   that do not).
 6. **Allocation failure is not swallowed.** Allocation sites use the two-value
    form (`strings.clone(s, allocator)`) and map a failure to
    `Error.Out_Of_Memory`, which the session turns into an error message. The one
@@ -257,8 +318,9 @@ Follow-on rules:
    ```
 
 9. **C callbacks set the runtime context themselves.** A `proc "c"` has no Odin
-   context, so `curl_transport.odin`'s two libcurl callbacks start with
-   `context = runtime.default_context()`. That is the idiom, not a loophole:
+   context, so `curl_transport.odin`'s three libcurl callbacks start with
+   `context = runtime.default_context()` (`write_callback` `:529`, `read_callback`
+   `:557`, `header_callback` `:576`). That is the idiom, not a loophole:
    nothing below them reads an allocator out of it — every buffer carries its own
    (`Buffer`) and every allocation takes the allocator as an argument.
 
@@ -279,15 +341,23 @@ tabs for indentation, trailing commas in multi-line literals, braces attached.
 -collection:src=src -vet -warnings-as-errors`. The suite covers the URL splitter
 and scheme heuristic, the parser (both `--flag value` and `--flag=value`, `--`
 terminator, usage errors), the request/response dispose helpers, the session's
-exit codes and rendered bytes, the Content-Type classifier, and the libcurl
-constants. Every test that allocates runs on a `mem.Tracking_Allocator` and
-finishes with `expect_no_leaks`, so the ownership rules above are *executed*,
-not just documented: a leak shows up as a non-zero balance when the allocator is
-checked, and the test fails. Tests that copy a fixture into an owning struct use
-the allocator, which is what makes a "forgot to clone" mistake visible.
-`tests/golden_test.odin` replays the captured reference bytes under the same
-tracker: `capture_argv` puts the argv array on the allocator that owns the
-strings it holds, so the replay leaves nothing behind either.
+exit codes and rendered bytes, the session store and cookie jar, the Content-Type
+classifier, and the libcurl constants. Every test that builds an owning struct
+runs on a `mem.Tracking_Allocator` and finishes with `expect_no_leaks`, so the
+ownership rules above are *executed*, not just documented: a leak shows up as a
+non-zero balance when the allocator is checked, and the test fails. Tests that
+copy a fixture into an owning struct use the allocator, which is what makes a
+"forgot to clone" mistake visible. Three files run no tracking allocator, so
+their allocations are not balance-checked (§8): `tests/charset_test.odin` and
+`tests/colorize_test.odin`, which do allocate (`charset_test.odin:205,233-234`,
+`colorize_test.odin:30,31,48` use `context.temp_allocator`), and
+`tests/libcurl_test.odin`, which also has none but allocates nothing at all.
+
+The colorize golden replay lives in `tests/colorize_test.odin`: it walks
+`tests/golden/colorize/` against `manifest.tsv` case by case (it must be run from
+the repository root) and prints
+`colorize goldens: <cases> cases, <mismatches> mismatches`.
+
 `tests/http_engine_test.odin` is the engine's part of the suite: it starts a
 one-thread HTTP server on 127.0.0.1:0 inside the test, records the raw bytes of
 every request it receives, and answers with a canned reply — so the assertions
@@ -296,27 +366,31 @@ header, the request line of each hop of a redirect chain) and about what the
 engine gives back (status, headers, decoded chunked/gzip bodies, typed errors
 for a refused connection, a failed lookup and a timeout), not about the engine's
 own idea of what it sent. It builds on its own (`odin test
-tests/http_engine_test.odin -file`), which is why its helpers are file-local.
+tests/http_engine_test.odin -file -collection:src=src` — `-file` needs the
+collection flag too), which is why its helpers are file-local.
 
 `local.mk` (git-ignored, `-include`d by the Makefile) holds per-machine toolchain
 paths; `make check-deps` reports a missing `odin` as an error.
 
 ## 6. CI
 
-`.github/workflows/ci.yml` runs on Ubuntu: installs `clang` and
-`libcurl4-openssl-dev` from apt, downloads the pinned Odin release
-(`ODIN_VERSION`, matching the toolchain above), then runs `make build`
-and `make test` — the same two commands a developer runs locally. A green CI run
-therefore means: zero warnings, and all Odin tests pass (including the ownership
-assertions).
+**There is no CI configuration in this tree.** `.github/` does not exist, so no
+workflow file is checked in and nothing runs on a push; earlier revisions of this
+document described a `.github/workflows/ci.yml` that was never landed. The gate
+is what a developer runs locally, on Ubuntu with `clang` and libcurl's
+development files (`libcurl4-openssl-dev`) installed: `make build` and
+`make test` — the same two commands a reviewer would run. A green run therefore
+means: zero warnings, and all Odin tests pass (including the ownership
+assertions). If a workflow is ever added it must run exactly those two commands,
+or this section has to be rewritten with it (see §8).
 
 ## 7. Who fills what in (and what must not change)
 
 | task | owns | must keep |
 | --- | --- | --- |
-| t_9a017f57 (CLI + renderer) | the body of `cli.parse.odin` (item grammar, config files, env defaults), `output/`, `format/` | the `Options`/`Parse_Error` shapes and their destroy procs; `output` keeps taking an `io.Writer` and staying allocation-free |
+| t_9a017f57 (CLI + renderer) | the body of `cli.parse.odin` (item grammar, config files, env defaults), `output/`, `format/` | the `Options`/`Parse_Error` shapes and their destroy procs; `output` keeps taking an `io.Writer` and keeps its allocators explicit (§2) |
 | t_3d62ca31 (engine) | `http.send`, the rest of `request_create` (query, headers, body encodings, auth), `libcurl.odin` additions | the `Request`/`Response` fields and destroy procs; the allocator rules in §4; no C outside `libcurl.odin` |
-| t_2ad8c0b2 (review) | `docs/REVIEW.md` | findings reference `file:line` and this document's rules; blockers are left for the owning task |
+| t_2ad8c0b2 (review) | the review output — `docs/REVIEW.md` was never landed; reviews now live in `docs/RATING.md` and `docs/security-findings.md` | findings reference `file:line` and this document's rules; blockers are left for the owning task |
 
 The engine's seam, as landed (t_3d62ca31):
 
@@ -378,9 +452,11 @@ The engine's seam, as landed (t_3d62ca31):
   reads it from the marks beside the string. docs/PARITY.md §3.4/§3.6 have the surfaces and the
   message shape.
 
-`src/session/` will grow session-file handling (`--session`, cookies) when that
-work lands; it stays the only layer that knows the order of an invocation, and
-the file formats are specified in `docs/PARITY.md`.
+`src/session/` owns session-file handling (`--session`, cookies:
+`session/store.odin`, `session/jar.odin`); it stays the only layer that knows the
+order of an invocation. The session JSON follows httpie's own file
+(`httpie/sessions.py`, `httpie/config.py`); the spec that used to be cited here,
+`docs/PARITY.md` §6.3, is absent from this tree (§8).
 
 Rules for every task that touches this tree:
 
@@ -392,6 +468,86 @@ Rules for every task that touches this tree:
    path — or add a test that proves otherwise to this document first.
 3. New owning types follow the `..._destroy(ptr)` pattern (allocator stored in
    the struct) and accept a zero value.
-4. Behaviour that the tests cannot decide comes from `docs/PARITY.md`, not from
-   preference; if PARITY.md is silent, capture the reference httpie's bytes and
-   add them there.
+4. Behaviour that the tests cannot decide comes from the reference `httpie` 3.2.4
+   — its source, or captures of its bytes — not from preference. The document
+   that used to record those decisions, `docs/PARITY.md`, is **not present in
+   this tree** (§8); read the citations to it in `src/` and `tests/` as pointers
+   to the reference implementation until it is restored.
+
+## 8. Known deviations and open items
+
+Everything above describes the tree at commit `c20e75e`. The items below are the
+places where the tree and its documentation were known to disagree at that
+commit. They are deliberately **flagged, not silently "fixed"**: each one needs
+either a code change or a human decision, and rewriting this document to hide it
+would only move the inaccuracy around (task t_6bb80c81).
+
+**Artifacts cited by the tree but absent from it.**
+
+- `docs/PARITY.md` — the reference-behaviour spec, cited across the tree (11
+  times in this file). §2, §3, §7 and §8 cite it, most with a section number;
+  today those citations point at the reference `httpie` 3.2.4 sources.
+- `docs/REVIEW.md`, `tests/golden_test.odin` + `capture_argv` — see §5 and §7.
+- `tests/parity/` and `tests/parity/server.py`.
+- `build/probe_*.py` / `build/probe_*.c` (wire and digest measurements) and the
+  `build/gen_*.py` table generators named by the generated files' own headers.
+- `docs/parity-captures/` (the help/error captures), `docs/COLORIZE.md`,
+  `tools/ref-capture/*`, `tools/gen-help-text.py`.
+- the repository has no `LICENSE` or `COPYING` file, so nothing in the tree
+  states the terms this port may be used or redistributed under.
+- `.gitignore:12-15` still ignores `/.capture-sandbox/`, described there as
+  scratch left behind by the removed parity harness; the directory itself is not
+  in any checkout. The rule is harmless, and it is left in place rather than
+  removed, because deleting it would change what a future run of that harness
+  would track.
+
+**Contracts the code does not meet yet.** 21 `context.temp_allocator` uses (§4);
+three allocator-less `make(` sites in `src/output` (§2); the three test files that
+run no tracking allocator — `tests/charset_test.odin` and
+`tests/colorize_test.odin` (which allocate), plus `tests/libcurl_test.odin`
+(which allocates nothing) (§5).
+
+**Code-vs-help-text disagreements — no documentation edit can fix them.** The
+`--help`/`--manual` bytes in `src/cli/help_text_generated.odin` are *recorded
+reference captures* of httpie's own output, not this port's prose, so they are
+not edited to agree with the port:
+
+- `REQUESTS_CA_BUNDLE` is advertised by `--help` but read by no code; the only
+  CA-bundle input is `--verify <path>` → `CURLOPT_CAINFO`
+  (`src/http/curl_transport.odin:1426`). A parity decision, not a doc fix.
+- the help text's session path (`[HTTPIE_CONFIG_DIR]/<HOST>/<SESSION_NAME>.json`,
+  `--help` line 264) differs from the implemented one
+  (`$HTTPIE_CONFIG_DIR/sessions/<host>_<port>/<name>.json`,
+  `src/session/store.odin:199-203` and the build at `:245-252`).
+- the help promises "for every `--OPTION` there is also a `--no-OPTION`", but the
+  blanket form fails on every option except `--no-sorted`/`--no-unsorted`:
+  `apply_no_options` passes the bare name to `reset_option`
+  (`src/cli/parse.odin:1785`), which compares it against names carrying the `--`
+  prefix (`:1800-1815`). **This is a code bug, not a doc bug**, and needs a code
+  fix.
+- `--history-print`/`-P`, `--no-sorted` and `--no-unsorted` are accepted by the
+  parser but appear in neither help text.
+
+**Point-in-time documents.** `docs/RATING.md` grades commit `f13d8f3`, eleven
+commits before `c20e75e`, and is deliberately left exactly as graded: its verdicts
+are its own, and what changed since (F1 and F6 fixed, F8 no longer reproducible)
+is recorded in `docs/security-findings.md` §V and here, not by rewriting the
+report. Read its counts and `file:line` citations as of `f13d8f3`; at the head of
+this revision the suite has 173 `@(test)` procs (not 167), `src` is 64,310 lines
+(not 64,112), the leak assertions number 116 (not 109), and `docs/PARITY.md` is
+cited 229 times under the report's own counting command, the one it prints three
+times (`rg -o 'PARITY\.md' . -g '!docs/RATING.md' | wc -l`; 223 at `f13d8f3`) —
+six more than at `f13d8f3`, five of them in `docs/security-findings.md` and one in
+this sentence. Restricted to the files that existed then (`src`, `tests`, this
+file, `README.md`, `Makefile`) the same references number 224, 213 of them inside
+`src`/`tests` comments. One of its caveats does not reproduce on the machine
+this revision was validated on — Ubuntu 24.04, libcurl 8.5.0, which is what §3
+pins — but it does reproduce on hosts whose libcurl is the 8.22.0 the report
+recorded.
+
+**Line-number citations.** This document was revised in 2026-09 (the full §1
+inventory, §2's real import graph, §4's restatement of the `temp_allocator` rule,
+§6's correction, this section), so `docs/ARCHITECTURE.md:<line>` citations
+recorded elsewhere — `docs/RATING.md`, `docs/security-findings.md` §5 — use the
+pre-revision numbering. Locate a passage by its section number or its quoted
+words; the section numbering is stable.

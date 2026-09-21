@@ -71,6 +71,16 @@ caveat (environment or line numbers); **NOT REPRODUCIBLE** = could not be reprod
 
 ## 3. Security statements in `docs/RATING.md` (every one appears exactly once)
 
+*The status column is a **review-time snapshot, not a statement about HEAD**: it
+records this review's own findings, taken at the commit named in §1, and §V
+records what changed afterwards. The five remediations planned in §9
+(`SF-001`…`SF-005`) landed after this review, so a `CONFIRMED` row states the
+review-time state rather than the current one: `SEC-01` (fixed by `SF-002`) and
+`SEC-05` (fixed by `SF-005`) are closed at HEAD, exactly like §4's
+`SEC-ADD-01`/`SEC-ADD-02`/`SEC-ADD-03`. The exceptions are `SEC-02`, `SEC-03`,
+`SEC-04` and `SEC-06`: they are *positive* controls, verified present at review
+time and still holding at HEAD, so their `CONFIRMED` status has no expiry.*
+
 | ID | concern | source quote (verbatim from `docs/RATING.md`) | severity | affected files | status | evidence notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | SEC-01 | Redirect credential handling (`should_strip_authorization`) diverges from the reference; restated in the overall rating and in dimension 5 | "ships a security-adjacent correctness bug in redirect credential handling" (Overall); "a real, localized behavioral divergence in `should_strip_authorization` (`src/http/curl_transport.odin:1177-1195`)" (D1); "The logic normalizes absent ports to 80/443 *before* comparing them (`:1186-1187`), which makes the documented http→https exception (`:1175-1176`, `:1194`) unreachable for default ports and also keeps credentials across a scheme change on a non-standard same port" (F1); "it strips auth on legitimate upgrades and forwards it across a scheme change on a non-standard port" (D5) | judge `MAJOR`; this review: **medium** (fail-open direction low-impact, fail-closed direction breaks authenticated redirects) | `src/http/curl_transport.odin:1177-1195`, called at `:1698`; skip at `:987-989` | **CONFIRMED** | The real proc was executed with a temporary `@(test)` in `src/http` (`odin test src/http …`) and returned `strip=true` for `http://h/a → https://h/b` and `strip=false` for `http://h:8080/a → https://h:8080/b` — identical to the judge's `odin` column. Independent harness vs `requests` 2.33.0 `should_strip_auth`: `7 cases, 3 divergence(s)` (exit 1). On the wire: `oj --follow --verify=no --auth user:pass` sent `Authorization: Basic dXNlcjpwYXNz` on hop 2 to `https://127.0.0.1:19003/secure` (probe log `[TLS]` hop + header), while `requests` refused/stripped it. `grep -rn 'should_strip\|strip_auth' tests` → no matches (exit 1), so no test covers it. |
@@ -84,6 +94,18 @@ caveat (environment or line numbers); **NOT REPRODUCIBLE** = could not be reprod
 
 ## 4. Additional security findings (not mentioned by the judge)
 
+*Status column as in §3: a review-time snapshot, not a statement about HEAD. Three of the five
+rows below were fixed after this review, each verified in §V — name the mapping:
+`SEC-ADD-01` (**high**, `Cookie` replayed onto a followed hop) → `SF-001` (§V.3);
+`SEC-ADD-02` (`--ciphers` parsed and silently ignored) → `SF-003` (§V.5);
+`SEC-ADD-03` (session files written `0644`) → `SF-004` (§V.6). All three are closed at HEAD
+`c20e75e`: the hop loop re-derives the jar's `Cookie` per hop (`session/jar.odin:195-222`),
+`CURLOPT_SSL_CIPHER_LIST` is set at `curl_transport.odin:1439`, and
+`SESSION_FILE_MODE = {Read_User, Write_User}` (`session/store.odin:50`) is re-asserted on every
+save (`:825`). The two rows that are **still live** are the DEFERRED items of §9.4:
+`SEC-ADD-04` (SHA-256 digest unsupported) is `SF-D1` and `SEC-ADD-05` (no
+`CURLOPT_SSLVERSION` pin) is `SF-D2`; both read the same at HEAD as at review time.*
+
 | ID | concern | source | severity | affected files | status | evidence notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | SEC-ADD-01 | **`Cookie` (and any other non-Authorization credential header) is never stripped on a redirect.** The hop loop removes only `Authorization`, and the per-hop `Cookie` recomputation the reference performs (`resolve_redirects`: `headers.pop("Cookie", None)` then `prepare_cookies` against the jar) has no counterpart — the header list built for the first URL is replayed verbatim on every hop | additional — my own finding (no counterpart in `docs/RATING.md`; F1 knows only about `Authorization`) | **high** | `src/http/curl_transport.odin:977-993` (skip list has no `Cookie`); `src/session/jar.odin:119-176` (jar header applied once, only if absent); `src/session/context.odin:1002` (single `session_apply_cookies` call); reference: `requests/sessions.py:235-243` | **CONFIRMED** | On the wire, cross-host (`127.0.0.1` → `127.0.0.2`), `oj --follow --auth alice:s3cr3t GET … 'Cookie:sess=TOPSECRET'` sent hop 2 `host='127.0.0.2:19901' auth=None cookie='sess=TOPSECRET'` while `requests` sent `auth=None cookie=None` — same request, same servers. Session-jar variant: an `httpie` session file with a cookie scoped `domain: 127.0.0.1` produced hop 2 `cookie='sess=JARSECRET'` at `host='127.0.0.2:19601'`; `requests` with the same cookie in its jar sent no cookie. `Secure` variant: a `secure: true` session cookie was sent over TLS on hop 1 **and in cleartext** on the hop-2 downgrade to `http://127.0.0.2:19802/landing` (`oj exit 0`, probe log `[PLAIN] … cookie='sess=SECUREJARSECRET'`); `requests` sent `cookie=None` there. |
@@ -95,6 +117,9 @@ caveat (environment or line numbers); **NOT REPRODUCIBLE** = could not be reprod
 ---
 
 ## 5. Non-security statements from `docs/RATING.md` (recorded for completeness)
+
+*As in §3, the status column is this review's at the commit named in §1; the later
+fixes are in §V.*
 
 RATING.md's other findings (F2–F5, F7–F9, dimension 6, the stale libcurl pin and the memory-ownership
 positives) are **contract/documentation/memory-safety** concerns, not security vulnerabilities.

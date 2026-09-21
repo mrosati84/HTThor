@@ -8,7 +8,9 @@ Documentation:
 
 | file | what it is |
 | --- | --- |
-| `docs/ARCHITECTURE.md` | module boundaries, the HTTP/TLS backend choice and its rationale, memory ownership rules, build/test/CI. **Read this before writing code.** |
+| `docs/ARCHITECTURE.md` | module boundaries, the HTTP/TLS backend choice and its rationale, memory ownership rules, build/test/CI, and the known deviations and open items. **Read this before writing code.** |
+| `docs/RATING.md` | a point-in-time quality rating of the tree at commit `f13d8f3`; read it as a snapshot, not as a description of the current code (see `docs/ARCHITECTURE.md` §8 for what changed since). |
+| `docs/security-findings.md` | the security review of that rating, the ranked remediation plan (SF-001…SF-005), the implementation notes, and the independent verification of the fixes. |
 
 ## Build and test
 
