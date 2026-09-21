@@ -110,8 +110,14 @@ Rules that hold the boundary in place:
   value models in `format/json.odin` and `format/xml.odin`. `Indent` lives here
   too because the CLI collects it (`--format-options json.indent=N`).
 - **The CLI is a parse, not a policy.** `cli.parse_args` returns Options or a
-  usage error; it never prints, never exits and never opens anything. Wording of
-  errors belongs to `output` (and to docs/PARITY.md).
+  usage error; it never prints and never exits, and the only filesystem reads it
+  performs are the ones parsing requires: the config file (`config_read`
+  → `config.json`, `parse.odin:2261`, called from `parse_args_with` `:3179`),
+  argparse's own readability probes (`file_is_readable` `:1745`, opening at
+  `:1746`; `file_is_openable_for_append` `:1755`, opening at `:1756`; both called
+  from the option validation at `:1300`/`:1306`), and the item files
+  (`cli/items.odin:861`). Wording of errors belongs to `output` (and to
+  docs/PARITY.md).
 - **Only `main` exits.** `session.run` returns an exit code (`cli.Exit_Code`);
   `main` destroys the Context and calls `os.exit` with it. Nothing else calls
   `os.exit`, and no `defer` in `main` is relied upon (defers do not run across
@@ -280,7 +286,7 @@ Follow-on rules:
    before returning `Out_Of_Memory`; `main` destroys the `Parse_Error` before
    exiting. There is no "the process is about to die anyway" reasoning in
    library code — the tests run their allocating paths on a
-   `mem.Tracking_Allocator` and assert a zero balance (§5 names the two files
+   `mem.Tracking_Allocator` and assert a zero balance (§5 names the three files
    that do not).
 6. **Allocation failure is not swallowed.** Allocation sites use the two-value
    form (`strings.clone(s, allocator)`) and map a failure to
@@ -341,9 +347,11 @@ runs on a `mem.Tracking_Allocator` and finishes with `expect_no_leaks`, so the
 ownership rules above are *executed*, not just documented: a leak shows up as a
 non-zero balance when the allocator is checked, and the test fails. Tests that
 copy a fixture into an owning struct use the allocator, which is what makes a
-"forgot to clone" mistake visible. Two files — `tests/charset_test.odin` and
-`tests/colorize_test.odin` — use no tracking allocator at all, so their
-allocations are not balance-checked (§8).
+"forgot to clone" mistake visible. Three files run no tracking allocator, so
+their allocations are not balance-checked (§8): `tests/charset_test.odin` and
+`tests/colorize_test.odin`, which do allocate (`charset_test.odin:205,233-234`,
+`colorize_test.odin:30,31,48` use `context.temp_allocator`), and
+`tests/libcurl_test.odin`, which also has none but allocates nothing at all.
 
 The colorize golden replay lives in `tests/colorize_test.odin`: it walks
 `tests/golden/colorize/` against `manifest.tsv` case by case (it must be run from
@@ -477,8 +485,8 @@ would only move the inaccuracy around (task t_6bb80c81).
 **Artifacts cited by the tree but absent from it.**
 
 - `docs/PARITY.md` — the reference-behaviour spec, cited across the tree (11
-  times in this file). §2, §3, §4 and §7 cite it by section number; today those
-  citations point at the reference `httpie` 3.2.4 sources.
+  times in this file). §2, §3, §7 and §8 cite it, most with a section number;
+  today those citations point at the reference `httpie` 3.2.4 sources.
 - `docs/REVIEW.md`, `tests/golden_test.odin` + `capture_argv` — see §5 and §7.
 - `tests/parity/` and `tests/parity/server.py`.
 - `build/probe_*.py` / `build/probe_*.c` (wire and digest measurements) and the
@@ -494,9 +502,10 @@ would only move the inaccuracy around (task t_6bb80c81).
   would track.
 
 **Contracts the code does not meet yet.** 21 `context.temp_allocator` uses (§4);
-three allocator-less `make(` sites in `src/output` (§2);
-`tests/charset_test.odin` and `tests/colorize_test.odin` run no tracking
-allocator (§5).
+three allocator-less `make(` sites in `src/output` (§2); the three test files that
+run no tracking allocator — `tests/charset_test.odin` and
+`tests/colorize_test.odin` (which allocate), plus `tests/libcurl_test.odin`
+(which allocates nothing) (§5).
 
 **Code-vs-help-text disagreements — no documentation edit can fix them.** The
 `--help`/`--manual` bytes in `src/cli/help_text_generated.odin` are *recorded
@@ -525,8 +534,11 @@ own, and what changed since (F1 and F6 fixed, F8 no longer reproducible) is
 recorded in `docs/security-findings.md` §V and here, not by rewriting the report.
 Read its counts and `file:line` citations as of `f13d8f3`; at `c20e75e` the suite
 has 173 `@(test)` procs (not 167), `src` is 64,310 lines (not 64,112), the leak
-assertions number 116 (not 109), and `docs/PARITY.md` is cited 229 times (not
-223). One of its caveats does not reproduce here: this machine's libcurl is
+assertions number 116 (not 109), and `docs/PARITY.md` is cited 224 times under
+that report's own counting command (`grep -ro 'PARITY\.md' src tests
+docs/ARCHITECTURE.md README.md Makefile`; 223 at `f13d8f3` — this revision adds
+one citation), or 229 across the same set plus `docs/security-findings.md`'s
+five. One of its caveats does not reproduce here: this machine's libcurl is
 8.5.0, which is what §3 pins, so the "stale pin" complaint is a property of the
 machine the report was measured on.
 

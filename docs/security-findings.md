@@ -71,10 +71,15 @@ caveat (environment or line numbers); **NOT REPRODUCIBLE** = could not be reprod
 
 ## 3. Security statements in `docs/RATING.md` (every one appears exactly once)
 
-*The status column records this review's own findings, taken at the commit named
-in §1. The five remediations planned in §9 (`SF-001`…`SF-005`) landed afterwards
-and are independently verified in §V — so an entry marked `CONFIRMED` below means
-"reproduced at review time", not "present in the current tree".*
+*The status column is a **review-time snapshot, not a statement about HEAD**: it
+records this review's own findings, taken at the commit named in §1, and §V
+records what changed afterwards. The five remediations planned in §9
+(`SF-001`…`SF-005`) landed after this review, so a `CONFIRMED` row states the
+review-time state rather than the current one: `SEC-01` (fixed by `SF-002`) and
+`SEC-05` (fixed by `SF-005`) are closed at HEAD, exactly like §4's
+`SEC-ADD-01`/`SEC-ADD-02`/`SEC-ADD-03`. The exceptions are `SEC-02`, `SEC-03`,
+`SEC-04` and `SEC-06`: they are *positive* controls, verified present at review
+time and still holding at HEAD, so their `CONFIRMED` status has no expiry.*
 
 | ID | concern | source quote (verbatim from `docs/RATING.md`) | severity | affected files | status | evidence notes |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -88,6 +93,18 @@ and are independently verified in §V — so an entry marked `CONFIRMED` below m
 ---
 
 ## 4. Additional security findings (not mentioned by the judge)
+
+*Status column as in §3: a review-time snapshot, not a statement about HEAD. Three of the five
+rows below were fixed after this review, each verified in §V — name the mapping:
+`SEC-ADD-01` (**high**, `Cookie` replayed onto a followed hop) → `SF-001` (§V.3);
+`SEC-ADD-02` (`--ciphers` parsed and silently ignored) → `SF-003` (§V.5);
+`SEC-ADD-03` (session files written `0644`) → `SF-004` (§V.6). All three are closed at HEAD
+`c20e75e`: the hop loop re-derives the jar's `Cookie` per hop (`session/jar.odin:195-222`),
+`CURLOPT_SSL_CIPHER_LIST` is set at `curl_transport.odin:1439`, and
+`SESSION_FILE_MODE = {Read_User, Write_User}` (`session/store.odin:50`) is re-asserted on every
+save (`:825`). The two rows that are **still live** are the DEFERRED items of §9.4:
+`SEC-ADD-04` (SHA-256 digest unsupported) is `SF-D1` and `SEC-ADD-05` (no
+`CURLOPT_SSLVERSION` pin) is `SF-D2`; both read the same at HEAD as at review time.*
 
 | ID | concern | source | severity | affected files | status | evidence notes |
 | --- | --- | --- | --- | --- | --- | --- |
