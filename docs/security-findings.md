@@ -71,6 +71,11 @@ caveat (environment or line numbers); **NOT REPRODUCIBLE** = could not be reprod
 
 ## 3. Security statements in `docs/RATING.md` (every one appears exactly once)
 
+*The status column records this review's own findings, taken at the commit named
+in §1. The five remediations planned in §9 (`SF-001`…`SF-005`) landed afterwards
+and are independently verified in §V — so an entry marked `CONFIRMED` below means
+"reproduced at review time", not "present in the current tree".*
+
 | ID | concern | source quote (verbatim from `docs/RATING.md`) | severity | affected files | status | evidence notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | SEC-01 | Redirect credential handling (`should_strip_authorization`) diverges from the reference; restated in the overall rating and in dimension 5 | "ships a security-adjacent correctness bug in redirect credential handling" (Overall); "a real, localized behavioral divergence in `should_strip_authorization` (`src/http/curl_transport.odin:1177-1195`)" (D1); "The logic normalizes absent ports to 80/443 *before* comparing them (`:1186-1187`), which makes the documented http→https exception (`:1175-1176`, `:1194`) unreachable for default ports and also keeps credentials across a scheme change on a non-standard same port" (F1); "it strips auth on legitimate upgrades and forwards it across a scheme change on a non-standard port" (D5) | judge `MAJOR`; this review: **medium** (fail-open direction low-impact, fail-closed direction breaks authenticated redirects) | `src/http/curl_transport.odin:1177-1195`, called at `:1698`; skip at `:987-989` | **CONFIRMED** | The real proc was executed with a temporary `@(test)` in `src/http` (`odin test src/http …`) and returned `strip=true` for `http://h/a → https://h/b` and `strip=false` for `http://h:8080/a → https://h:8080/b` — identical to the judge's `odin` column. Independent harness vs `requests` 2.33.0 `should_strip_auth`: `7 cases, 3 divergence(s)` (exit 1). On the wire: `oj --follow --verify=no --auth user:pass` sent `Authorization: Basic dXNlcjpwYXNz` on hop 2 to `https://127.0.0.1:19003/secure` (probe log `[TLS]` hop + header), while `requests` refused/stripped it. `grep -rn 'should_strip\|strip_auth' tests` → no matches (exit 1), so no test covers it. |
@@ -95,6 +100,9 @@ caveat (environment or line numbers); **NOT REPRODUCIBLE** = could not be reprod
 ---
 
 ## 5. Non-security statements from `docs/RATING.md` (recorded for completeness)
+
+*As in §3, the status column is this review's at the commit named in §1; the later
+fixes are in §V.*
 
 RATING.md's other findings (F2–F5, F7–F9, dimension 6, the stale libcurl pin and the memory-ownership
 positives) are **contract/documentation/memory-safety** concerns, not security vulnerabilities.
