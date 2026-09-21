@@ -1782,7 +1782,11 @@ apply_no_options :: proc(p: ^Parser) -> string {
 			append(&invalid, option)
 			continue
 		}
-		if !reset_option(p, option[5:]) {
+		// `--no-option` => `--option`: the inverted name is spelled the way the
+		// option table spells its names, `--OPTION` and not `OPTION`.
+		inverted := strings.concatenate({"--", option[5:]}, allocator)
+		defer delete(inverted, allocator)
+		if !reset_option(p, inverted) {
 			append(&invalid, option)
 		}
 	}
@@ -1794,8 +1798,9 @@ apply_no_options :: proc(p: ^Parser) -> string {
 	return strings.concatenate({"unrecognized arguments: ", joined}, allocator)
 }
 
-// reset_option is the `--no-OPTION` -> `--OPTION` lookup: the inverted name has
-// to be a real option string, and its dest goes back to the argparse default.
+// reset_option is the `--no-OPTION` -> `--OPTION` lookup: `name` is the
+// inverted option string (`--OPTION`, the form the caller builds), which has to
+// be a real option string, and its dest goes back to the argparse default.
 @(private)
 reset_option :: proc(p: ^Parser, name: string) -> bool {
 	ns := p.ns
