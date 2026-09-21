@@ -540,9 +540,10 @@ times (`rg -o 'PARITY\.md' . -g '!docs/RATING.md' | wc -l`; 223 at `f13d8f3`) �
 six more than at `f13d8f3`, five of them in `docs/security-findings.md` and one in
 this sentence. Restricted to the files that existed then (`src`, `tests`, this
 file, `README.md`, `Makefile`) the same references number 224, 213 of them inside
-`src`/`tests` comments. One of its caveats does not reproduce here: this machine's
-libcurl is 8.5.0, which is what §3 pins, so the "stale pin" complaint is a
-property of the machine the report was measured on.
+`src`/`tests` comments. One of its caveats does not reproduce on the machine
+this revision was validated on — Ubuntu 24.04, libcurl 8.5.0, which is what §3
+pins — but it does reproduce on hosts whose libcurl is the 8.22.0 the report
+recorded.
 
 **Line-number citations.** This document was revised in 2026-09 (the full §1
 inventory, §2's real import graph, §4's restatement of the `temp_allocator` rule,
