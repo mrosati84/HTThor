@@ -1,5 +1,33 @@
 # oj (htthor) — Evidence-Based Quality Rating
 
+> **Status at HEAD (added by the documentation-integrity pass, `t_e66f290f`).**
+> This report is a **point-in-time** document: it grades commit `f13d8f3` and none
+> of its verdicts are rewritten. Later work resolved some of what it found and
+> moved several of its counts, so read every number and `file:line` below as of
+> `f13d8f3` — and check this table before acting on a finding:
+>
+> | finding | status at HEAD `c20e75e` |
+> | --- | --- |
+> | F1 redirect credentials | **fixed** — `should_strip_authorization` (`src/http/curl_transport.odin:1220`) now reproduces `requests`' ordering and is covered by `tests/http_test.odin:1497`; landed as `SF-002` |
+> | F2 `docs/PARITY.md` absent | **still live** — still absent, still cited 224 times |
+> | F3 documented CI workflow | **fixed in the docs** — `docs/ARCHITECTURE.md` §6 now states that this tree has no CI; no workflow ships either way |
+> | F4 21 `context.temp_allocator` uses | **still live** — 21, unchanged |
+> | F5 `src/output` allocates | **still live** — the same 10 `make(` sites, 3 of them without an allocator (`colorize.odin:917,919,947`) |
+> | F6 unvalidated libcurl constants | **fixed** — `tests/libcurl_test.odin:56,68` now check `CURLOPT_READDATA`/`CURLOPT_READFUNCTION`; landed as `SF-005` |
+> | F7 missing provenance artifacts | **mostly live** — `tests/parity/`, `build/probe_*` and `tools/` are still absent and still cited in `src`/`tests` comments; `docs/ARCHITECTURE.md` no longer presents `tests/golden_test.odin`, `capture_argv` or `docs/REVIEW.md` as present (§8 lists them as absent) |
+> | F8 sandbox vs README purity | **no longer reproducible** — `.capture-sandbox/` is in no checkout; the stale `.gitignore` rule is recorded in §8 |
+> | F9 C callback count | **fixed in the docs** — `docs/ARCHITECTURE.md` §4 now says three, matching `curl_transport.odin:529,557,576` |
+>
+> Counts at HEAD, under this report's own commands: 173 `@(test)` procs (not 167),
+> 64,310 `src` lines (not 64,112), 116 leak assertions (85 `expect_no_leaks` + 31
+> `engine_no_leaks`, not 109), 224 `docs/PARITY.md` references (not 223).
+> `docs/ARCHITECTURE.md` §8 carries the full list of what changed and what is
+> still open; `docs/security-findings.md` §V verifies the security fixes. Two
+> caveats below are properties of the machine this report was measured on: its
+> libcurl is 8.22.0 (this host runs 8.5.0, the version `docs/ARCHITECTURE.md`
+> pins), and its reproduction block is written for
+> `/home/matteo/Projects/htthor`, which is not this checkout's path.
+
 ## Scope and method
 
 This report assesses the Odin port of `httpie`, `oj`, at observed commit
