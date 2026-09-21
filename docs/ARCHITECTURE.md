@@ -528,19 +528,21 @@ not edited to agree with the port:
 - `--history-print`/`-P`, `--no-sorted` and `--no-unsorted` are accepted by the
   parser but appear in neither help text.
 
-**Point-in-time documents.** `docs/RATING.md` grades commit `f13d8f3`, 11 commits
-before this one, and is deliberately left exactly as graded: its verdicts are its
-own, and what changed since (F1 and F6 fixed, F8 no longer reproducible) is
-recorded in `docs/security-findings.md` §V and here, not by rewriting the report.
-Read its counts and `file:line` citations as of `f13d8f3`; at `c20e75e` the suite
-has 173 `@(test)` procs (not 167), `src` is 64,310 lines (not 64,112), the leak
-assertions number 116 (not 109), and `docs/PARITY.md` is cited 224 times under
-that report's own counting command (`grep -ro 'PARITY\.md' src tests
-docs/ARCHITECTURE.md README.md Makefile`; 223 at `f13d8f3` — this revision adds
-one citation), or 229 across the same set plus `docs/security-findings.md`'s
-five. One of its caveats does not reproduce here: this machine's libcurl is
-8.5.0, which is what §3 pins, so the "stale pin" complaint is a property of the
-machine the report was measured on.
+**Point-in-time documents.** `docs/RATING.md` grades commit `f13d8f3`, eleven
+commits before `c20e75e`, and is deliberately left exactly as graded: its verdicts
+are its own, and what changed since (F1 and F6 fixed, F8 no longer reproducible)
+is recorded in `docs/security-findings.md` §V and here, not by rewriting the
+report. Read its counts and `file:line` citations as of `f13d8f3`; at the head of
+this revision the suite has 173 `@(test)` procs (not 167), `src` is 64,310 lines
+(not 64,112), the leak assertions number 116 (not 109), and `docs/PARITY.md` is
+cited 229 times under the report's own counting command, the one it prints three
+times (`rg -o 'PARITY\.md' . -g '!docs/RATING.md' | wc -l`; 223 at `f13d8f3`) —
+six more than at `f13d8f3`, five of them in `docs/security-findings.md` and one in
+this sentence. Restricted to the files that existed then (`src`, `tests`, this
+file, `README.md`, `Makefile`) the same references number 224, 213 of them inside
+`src`/`tests` comments. One of its caveats does not reproduce here: this machine's
+libcurl is 8.5.0, which is what §3 pins, so the "stale pin" complaint is a
+property of the machine the report was measured on.
 
 **Line-number citations.** This document was revised in 2026-09 (the full §1
 inventory, §2's real import graph, §4's restatement of the `temp_allocator` rule,

@@ -9,7 +9,7 @@
 > | finding | status at HEAD `c20e75e` |
 > | --- | --- |
 > | F1 redirect credentials | **fixed** — `should_strip_authorization` (`src/http/curl_transport.odin:1220`) now reproduces `requests`' ordering and is covered by `tests/http_test.odin:1497`; landed as `SF-002` |
-> | F2 `docs/PARITY.md` absent | **still live** — still absent, still cited 224 times |
+> | F2 `docs/PARITY.md` absent | **still live** — still absent, still cited 229 times under this report's own counter (223 at `f13d8f3`) |
 > | F3 documented CI workflow | **fixed in the docs** — `docs/ARCHITECTURE.md` §6 now states that this tree has no CI; no workflow ships either way |
 > | F4 21 `context.temp_allocator` uses | **still live** — 21, unchanged |
 > | F5 `src/output` allocates | **still live** — the same 10 `make(` sites, 3 of them without an allocator (`colorize.odin:917,919,947`) |
@@ -20,7 +20,11 @@
 >
 > Counts at HEAD, under this report's own commands: 173 `@(test)` procs (not 167),
 > 64,310 `src` lines (not 64,112), 116 leak assertions (85 `expect_no_leaks` + 31
-> `engine_no_leaks`, not 109), 224 `docs/PARITY.md` references (not 223).
+> `engine_no_leaks`, not 109), 229 `docs/PARITY.md` references (not 223: five of
+> the six added since are in `docs/security-findings.md`, one in
+> `docs/ARCHITECTURE.md`; on the narrower set `src`, `tests`,
+> `docs/ARCHITECTURE.md`, `README.md`, `Makefile` the count is 224, 213 of them in
+> `src`/`tests`).
 > `docs/ARCHITECTURE.md` §8 carries the full list of what changed and what is
 > still open; `docs/security-findings.md` §V verifies the security fixes. Two
 > caveats below are properties of the machine this report was measured on: its
